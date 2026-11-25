@@ -241,13 +241,17 @@ static UIView *DFECreateNativeIconView(NSString *bundleID, CGRect targetBounds, 
             }
         }
 
-        // 6. Disable drag-out interaction & long-hold jiggle/editing gesture on DockFlip extra page
+        // 6. Disable drag-out & forbid editing mode on DockFlip extra-page SBIconView
         for (id<UIInteraction> inter in iconView.interactions) {
             if ([inter isKindOfClass:[UIDragInteraction class]]) {
                 ((UIDragInteraction *)inter).enabled = NO;
             }
         }
         objc_setAssociatedObject(iconView, kDFEIsDockFlipIconKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        SEL forbidSel = NSSelectorFromString(@"startForbiddingEditingModeWithReason:");
+        if ([iconView respondsToSelector:forbidSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(iconView, forbidSel, @"DockFlipEnhance");
+        }
         DFEDisableEditingLongPressOnIconView(iconView);
 
         return iconView;
@@ -274,6 +278,53 @@ static void hook_handleEditingModeGesture(id self, SEL _cmd, id recognizer) {
     }
     if (orig_handleEditingModeGesture) {
         orig_handleEditingModeGesture(self, _cmd, recognizer);
+    }
+}
+
+static BOOL (*orig_canBeginDrags)(id, SEL);
+static BOOL hook_canBeginDrags(id self, SEL _cmd) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        return NO;
+    }
+    return orig_canBeginDrags ? orig_canBeginDrags(self, _cmd) : NO;
+}
+
+static BOOL (*orig_allowDragAfterDismiss)(id, SEL, id);
+static BOOL hook_allowDragAfterDismiss(id self, SEL _cmd, id interaction) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        return NO;
+    }
+    return orig_allowDragAfterDismiss ? orig_allowDragAfterDismiss(self, _cmd, interaction) : NO;
+}
+
+static BOOL (*orig_mgr_iconViewEditingFired)(id, SEL, id, id);
+static BOOL hook_mgr_iconViewEditingFired(id self, SEL _cmd, id iconView, id recognizer) {
+    if (iconView && objc_getAssociatedObject(iconView, kDFEIsDockFlipIconKey)) {
+        return NO;
+    }
+    return orig_mgr_iconViewEditingFired ? orig_mgr_iconViewEditingFired(self, _cmd, iconView, recognizer) : NO;
+}
+
+static void (*orig_mgr_folderShouldBeginEditing)(id, SEL, id, BOOL);
+static void hook_mgr_folderShouldBeginEditing(id self, SEL _cmd, id folderController, BOOL withHaptic) {
+    // Block background SBRootFolderView empty-space long-press from firing jiggle mode
+    // while a DockFlip extra-page icon is showing or activating its context menu.
+    SEL showingSel = NSSelectorFromString(@"isShowingIconContextMenu");
+    SEL iconViewShowingSel = NSSelectorFromString(@"iconViewShowingContextMenu");
+    if ([self respondsToSelector:iconViewShowingSel]) {
+        id iv = ((id (*)(id, SEL))objc_msgSend)(self, iconViewShowingSel);
+        if (iv && objc_getAssociatedObject(iv, kDFEIsDockFlipIconKey)) {
+            return;
+        }
+    }
+    if ([self respondsToSelector:showingSel]) {
+        BOOL showing = ((BOOL (*)(id, SEL))objc_msgSend)(self, showingSel);
+        if (showing) {
+            return;
+        }
+    }
+    if (orig_mgr_folderShouldBeginEditing) {
+        orig_mgr_folderShouldBeginEditing(self, _cmd, folderController, withHaptic);
     }
 }
 
@@ -510,14 +561,34 @@ static void TryHookDockFlipController(void) {
         if ([sbIconViewCls instancesRespondToSelector:handleSel]) {
             MSHookMessageEx(sbIconViewCls, handleSel, (IMP)hook_handleEditingModeGesture, (IMP *)&orig_handleEditingModeGesture);
         }
+        SEL canDragSel = NSSelectorFromString(@"canBeginDrags");
+        if ([sbIconViewCls instancesRespondToSelector:canDragSel]) {
+            MSHookMessageEx(sbIconViewCls, canDragSel, (IMP)hook_canBeginDrags, (IMP *)&orig_canBeginDrags);
+        }
+        SEL dragAfterSel = NSSelectorFromString(@"_contextMenuInteractionShouldAllowDragAfterDismiss:");
+        if ([sbIconViewCls instancesRespondToSelector:dragAfterSel]) {
+            MSHookMessageEx(sbIconViewCls, dragAfterSel, (IMP)hook_allowDragAfterDismiss, (IMP *)&orig_allowDragAfterDismiss);
+        }
     }
 
-    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.1 unclamped loop + native SBIconView without long-hold jiggle)");
+    Class iconMgrCls = objc_getClass("SBHIconManager");
+    if (iconMgrCls) {
+        SEL mgrFireSel = NSSelectorFromString(@"iconView:editingModeGestureRecognizerDidFire:");
+        if ([iconMgrCls instancesRespondToSelector:mgrFireSel]) {
+            MSHookMessageEx(iconMgrCls, mgrFireSel, (IMP)hook_mgr_iconViewEditingFired, (IMP *)&orig_mgr_iconViewEditingFired);
+        }
+        SEL folderEditSel = NSSelectorFromString(@"folderControllerShouldBeginEditing:withHaptic:");
+        if ([iconMgrCls instancesRespondToSelector:folderEditSel]) {
+            MSHookMessageEx(iconMgrCls, folderEditSel, (IMP)hook_mgr_folderShouldBeginEditing, (IMP *)&orig_mgr_folderShouldBeginEditing);
+        }
+    }
+
+    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.2 unclamped loop + native SBIconView + full jiggle guard)");
 }
 
 __attribute__((constructor))
 static void DockFlipEnhanceInit(void) {
-    os_log(DFELog(), "[DockFlipEnhance] initialized (v0.2.1)");
+    os_log(DFELog(), "[DockFlipEnhance] initialized (v0.2.2)");
     TryHookDockFlipController();
 
     if (!gHooked) {
