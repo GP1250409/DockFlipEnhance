@@ -44,6 +44,31 @@
 @end
 
 static BOOL gDFEVerticalDockActive = NO;
+static __weak UIPanGestureRecognizer *gDFEDockPan = nil;
+
+static BOOL (*orig_dragShouldDelayCompeting)(id, SEL, id, id);
+static BOOL hook_dragShouldDelayCompeting(id self, SEL _cmd, id dragInteraction, id competingGR) {
+    if (competingGR && competingGR == gDFEDockPan) {
+        return NO;
+    }
+    return orig_dragShouldDelayCompeting ? orig_dragShouldDelayCompeting(self, _cmd, dragInteraction, competingGR) : NO;
+}
+
+static BOOL (*orig_dragCanExcludeCompeting)(id, SEL, id, id);
+static BOOL hook_dragCanExcludeCompeting(id self, SEL _cmd, id dragInteraction, id competingGR) {
+    if (competingGR && competingGR == gDFEDockPan) {
+        return NO;
+    }
+    return orig_dragCanExcludeCompeting ? orig_dragCanExcludeCompeting(self, _cmd, dragInteraction, competingGR) : NO;
+}
+
+static BOOL (*orig_dragCompetingShouldDelayLift)(id, SEL, id, id);
+static BOOL hook_dragCompetingShouldDelayLift(id self, SEL _cmd, id dragInteraction, id competingGR) {
+    if (competingGR && competingGR == gDFEDockPan) {
+        return YES;
+    }
+    return orig_dragCompetingShouldDelayLift ? orig_dragCompetingShouldDelayLift(self, _cmd, dragInteraction, competingGR) : NO;
+}
 
 static BOOL DFEIsVerticalDock(DockFlipController *ctrl) {
     UIView *ref = ctrl.page ?: ctrl.dock;
@@ -84,6 +109,7 @@ static void DFERefreshEdgeDeferralForDock(UIView *dock) {
 static void DFETunePanForOrientation(DockFlipController *ctrl, BOOL vertical) {
     UIPanGestureRecognizer *pan = ctrl.pan;
     if (pan) {
+        gDFEDockPan = pan;
         pan.cancelsTouchesInView = YES;
         SEL hystSel = NSSelectorFromString(@"_setHysteresis:");
         if ([pan respondsToSelector:hystSel]) {
@@ -705,12 +731,18 @@ static BOOL hook_gestureShouldBegin(DockFlipController *self, SEL _cmd, UIGestur
 }
 
 static BOOL hook_shouldBeRequiredToFail(DockFlipController *self, SEL _cmd, UIGestureRecognizer *gr, UIGestureRecognizer *other) {
+    if (gr == self.pan) {
+        gDFEDockPan = self.pan;
+    }
     if (gr == self.pan && DFEIsVerticalDock(self) && other) {
         if ([other isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
             return NO;
         }
         if ([other isKindOfClass:[UIPanGestureRecognizer class]] ||
             [other isKindOfClass:[UISwipeGestureRecognizer class]]) {
+            return YES;
+        }
+        if ([other isKindOfClass:[UITapGestureRecognizer class]] && self.dock && other.view && [other.view isDescendantOfView:self.dock]) {
             return YES;
         }
     }
@@ -979,6 +1011,18 @@ static void TryHookDockFlipController(void) {
         SEL dragAfterSel = NSSelectorFromString(@"_contextMenuInteractionShouldAllowDragAfterDismiss:");
         if ([sbIconViewCls instancesRespondToSelector:dragAfterSel]) {
             MSHookMessageEx(sbIconViewCls, dragAfterSel, (IMP)hook_allowDragAfterDismiss, (IMP *)&orig_allowDragAfterDismiss);
+        }
+        SEL dragDelaySel = NSSelectorFromString(@"_dragInteraction:shouldDelayCompetingGestureRecognizer:");
+        if ([sbIconViewCls instancesRespondToSelector:dragDelaySel]) {
+            MSHookMessageEx(sbIconViewCls, dragDelaySel, (IMP)hook_dragShouldDelayCompeting, (IMP *)&orig_dragShouldDelayCompeting);
+        }
+        SEL dragExcludeSel = NSSelectorFromString(@"_dragInteraction:canExcludeCompetingGestureRecognizer:");
+        if ([sbIconViewCls instancesRespondToSelector:dragExcludeSel]) {
+            MSHookMessageEx(sbIconViewCls, dragExcludeSel, (IMP)hook_dragCanExcludeCompeting, (IMP *)&orig_dragCanExcludeCompeting);
+        }
+        SEL dragDelayLiftSel = NSSelectorFromString(@"_dragInteraction:competingGestureRecognizerShouldDelayLift:");
+        if ([sbIconViewCls instancesRespondToSelector:dragDelayLiftSel]) {
+            MSHookMessageEx(sbIconViewCls, dragDelayLiftSel, (IMP)hook_dragCompetingShouldDelayLift, (IMP *)&orig_dragCompetingShouldDelayLift);
         }
         MSHookMessageEx(sbIconViewCls, @selector(touchesBegan:withEvent:), (IMP)hook_touchesBegan, (IMP *)&orig_touchesBegan);
         MSHookMessageEx(sbIconViewCls, @selector(touchesEnded:withEvent:), (IMP)hook_touchesEnded, (IMP *)&orig_touchesEnded);
