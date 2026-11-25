@@ -513,13 +513,11 @@ static void DFERelayoutPageVerticallyIfNeeded(DockFlipController *ctrl, UIView *
         CGRect f2 = last.frame;
         CGFloat y1 = CGRectGetMidY(f1);
         CGFloat y2 = CGRectGetMidY(f2);
-        CGFloat x1 = CGRectGetMidX(f1);
 
         if ([first respondsToSelector:imgFrameSel]) {
             CGRect imgF = ((CGRect (*)(id, SEL))objc_msgSend)(first, imgFrameSel);
             if (imgF.size.width > 1.0) {
                 iconSize = imgF.size.width;
-                x1 = f1.origin.x + CGRectGetMidX(imgF);
                 y1 = f1.origin.y + CGRectGetMidY(imgF);
             }
         } else if (f1.size.width > 1.0) {
