@@ -305,26 +305,141 @@ static BOOL hook_mgr_iconViewEditingFired(id self, SEL _cmd, id iconView, id rec
     return orig_mgr_iconViewEditingFired ? orig_mgr_iconViewEditingFired(self, _cmd, iconView, recognizer) : NO;
 }
 
+static BOOL gDockFlipTouchActive = NO;
+static BOOL gDockFlipContextMenuOpen = NO;
+static CFAbsoluteTime gLastDockFlipContextMenuEndTime = 0.0;
+static CFAbsoluteTime gAllowExplicitEditMenuUntil = 0.0;
+
+static BOOL DFEShouldBlockEditingMode(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now < gAllowExplicitEditMenuUntil) {
+        return NO;
+    }
+    if (gDockFlipTouchActive || gDockFlipContextMenuOpen) {
+        return YES;
+    }
+    if ((now - gLastDockFlipContextMenuEndTime) < 0.5) {
+        return YES;
+    }
+    return NO;
+}
+
+static void (*orig_touchesBegan)(id, SEL, id, id);
+static void hook_touchesBegan(id self, SEL _cmd, id touches, id event) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        gDockFlipTouchActive = YES;
+    }
+    if (orig_touchesBegan) {
+        orig_touchesBegan(self, _cmd, touches, event);
+    }
+}
+
+static void (*orig_touchesEnded)(id, SEL, id, id);
+static void hook_touchesEnded(id self, SEL _cmd, id touches, id event) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        gDockFlipTouchActive = NO;
+    }
+    if (orig_touchesEnded) {
+        orig_touchesEnded(self, _cmd, touches, event);
+    }
+}
+
+static void (*orig_touchesCancelled)(id, SEL, id, id);
+static void hook_touchesCancelled(id self, SEL _cmd, id touches, id event) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        gDockFlipTouchActive = NO;
+    }
+    if (orig_touchesCancelled) {
+        orig_touchesCancelled(self, _cmd, touches, event);
+    }
+}
+
+static id (*orig_ctxConfig)(id, SEL, id, CGPoint);
+static id hook_ctxConfig(id self, SEL _cmd, id interaction, CGPoint location) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        gDockFlipContextMenuOpen = YES;
+    }
+    return orig_ctxConfig ? orig_ctxConfig(self, _cmd, interaction, location) : nil;
+}
+
+static void (*orig_ctxWillDisplay)(id, SEL, id, id, id);
+static void hook_ctxWillDisplay(id self, SEL _cmd, id interaction, id config, id animator) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        gDockFlipContextMenuOpen = YES;
+    }
+    if (orig_ctxWillDisplay) {
+        orig_ctxWillDisplay(self, _cmd, interaction, config, animator);
+    }
+}
+
+static void (*orig_ctxWillEnd)(id, SEL, id, id, id);
+static void hook_ctxWillEnd(id self, SEL _cmd, id interaction, id config, id animator) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        gDockFlipContextMenuOpen = NO;
+        gDockFlipTouchActive = NO;
+        gLastDockFlipContextMenuEndTime = CFAbsoluteTimeGetCurrent();
+    }
+    if (orig_ctxWillEnd) {
+        orig_ctxWillEnd(self, _cmd, interaction, config, animator);
+    }
+}
+
+static void (*orig_activateShortcut)(id, SEL, id, id, id);
+static void hook_activateShortcut(id self, SEL _cmd, id item, id bundleID, id iconView) {
+    // If user explicitly taps "Edit Home Screen" / rearrange shortcut inside the menu, allow editing mode
+    @try {
+        SEL typeSel = NSSelectorFromString(@"type");
+        if (item && [item respondsToSelector:typeSel]) {
+            NSString *type = ((id (*)(id, SEL))objc_msgSend)(item, typeSel);
+            if ([type isKindOfClass:[NSString class]] &&
+                ([type rangeOfString:@"rearrange" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                 [type rangeOfString:@"edit" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
+                gAllowExplicitEditMenuUntil = CFAbsoluteTimeGetCurrent() + 2.0;
+            }
+        }
+    } @catch (__unused NSException *ex) {}
+    if (orig_activateShortcut) {
+        orig_activateShortcut(self, _cmd, item, bundleID, iconView);
+    }
+}
+
 static void (*orig_mgr_folderShouldBeginEditing)(id, SEL, id, BOOL);
 static void hook_mgr_folderShouldBeginEditing(id self, SEL _cmd, id folderController, BOOL withHaptic) {
-    // Block background SBRootFolderView empty-space long-press from firing jiggle mode
-    // while a DockFlip extra-page icon is showing or activating its context menu.
-    SEL showingSel = NSSelectorFromString(@"isShowingIconContextMenu");
-    SEL iconViewShowingSel = NSSelectorFromString(@"iconViewShowingContextMenu");
-    if ([self respondsToSelector:iconViewShowingSel]) {
-        id iv = ((id (*)(id, SEL))objc_msgSend)(self, iconViewShowingSel);
-        if (iv && objc_getAssociatedObject(iv, kDFEIsDockFlipIconKey)) {
-            return;
-        }
-    }
-    if ([self respondsToSelector:showingSel]) {
-        BOOL showing = ((BOOL (*)(id, SEL))objc_msgSend)(self, showingSel);
-        if (showing) {
-            return;
-        }
+    if (DFEShouldBlockEditingMode()) {
+        return;
     }
     if (orig_mgr_folderShouldBeginEditing) {
         orig_mgr_folderShouldBeginEditing(self, _cmd, folderController, withHaptic);
+    }
+}
+
+static void (*orig_mgr_setEditing)(id, SEL, BOOL);
+static void hook_mgr_setEditing(id self, SEL _cmd, BOOL editing) {
+    if (editing && DFEShouldBlockEditingMode()) {
+        return;
+    }
+    if (orig_mgr_setEditing) {
+        orig_mgr_setEditing(self, _cmd, editing);
+    }
+}
+
+static void (*orig_mgr_setEditingFromIconView)(id, SEL, BOOL, id);
+static void hook_mgr_setEditingFromIconView(id self, SEL _cmd, BOOL editing, id iconView) {
+    if (editing && (DFEShouldBlockEditingMode() || (iconView && objc_getAssociatedObject(iconView, kDFEIsDockFlipIconKey) && CFAbsoluteTimeGetCurrent() >= gAllowExplicitEditMenuUntil))) {
+        return;
+    }
+    if (orig_mgr_setEditingFromIconView) {
+        orig_mgr_setEditingFromIconView(self, _cmd, editing, iconView);
+    }
+}
+
+static void (*orig_mgr_setEditingWithFeedback)(id, SEL, BOOL, id);
+static void hook_mgr_setEditingWithFeedback(id self, SEL _cmd, BOOL editing, id feedback) {
+    if (editing && DFEShouldBlockEditingMode()) {
+        return;
+    }
+    if (orig_mgr_setEditingWithFeedback) {
+        orig_mgr_setEditingWithFeedback(self, _cmd, editing, feedback);
     }
 }
 
@@ -569,6 +684,25 @@ static void TryHookDockFlipController(void) {
         if ([sbIconViewCls instancesRespondToSelector:dragAfterSel]) {
             MSHookMessageEx(sbIconViewCls, dragAfterSel, (IMP)hook_allowDragAfterDismiss, (IMP *)&orig_allowDragAfterDismiss);
         }
+        MSHookMessageEx(sbIconViewCls, @selector(touchesBegan:withEvent:), (IMP)hook_touchesBegan, (IMP *)&orig_touchesBegan);
+        MSHookMessageEx(sbIconViewCls, @selector(touchesEnded:withEvent:), (IMP)hook_touchesEnded, (IMP *)&orig_touchesEnded);
+        MSHookMessageEx(sbIconViewCls, @selector(touchesCancelled:withEvent:), (IMP)hook_touchesCancelled, (IMP *)&orig_touchesCancelled);
+        SEL ctxCfgSel = @selector(contextMenuInteraction:configurationForMenuAtLocation:);
+        if ([sbIconViewCls instancesRespondToSelector:ctxCfgSel]) {
+            MSHookMessageEx(sbIconViewCls, ctxCfgSel, (IMP)hook_ctxConfig, (IMP *)&orig_ctxConfig);
+        }
+        SEL ctxDispSel = @selector(contextMenuInteraction:willDisplayMenuForConfiguration:animator:);
+        if ([sbIconViewCls instancesRespondToSelector:ctxDispSel]) {
+            MSHookMessageEx(sbIconViewCls, ctxDispSel, (IMP)hook_ctxWillDisplay, (IMP *)&orig_ctxWillDisplay);
+        }
+        SEL ctxEndSel = @selector(contextMenuInteraction:willEndForConfiguration:animator:);
+        if ([sbIconViewCls instancesRespondToSelector:ctxEndSel]) {
+            MSHookMessageEx(sbIconViewCls, ctxEndSel, (IMP)hook_ctxWillEnd, (IMP *)&orig_ctxWillEnd);
+        }
+        SEL actShortSel = NSSelectorFromString(@"activateShortcut:withBundleIdentifier:forIconView:");
+        if ([sbIconViewCls respondsToSelector:actShortSel]) {
+            MSHookMessageEx(object_getClass(sbIconViewCls), actShortSel, (IMP)hook_activateShortcut, (IMP *)&orig_activateShortcut);
+        }
     }
 
     Class iconMgrCls = objc_getClass("SBHIconManager");
@@ -581,14 +715,26 @@ static void TryHookDockFlipController(void) {
         if ([iconMgrCls instancesRespondToSelector:folderEditSel]) {
             MSHookMessageEx(iconMgrCls, folderEditSel, (IMP)hook_mgr_folderShouldBeginEditing, (IMP *)&orig_mgr_folderShouldBeginEditing);
         }
+        SEL setEditSel = NSSelectorFromString(@"setEditing:");
+        if ([iconMgrCls instancesRespondToSelector:setEditSel]) {
+            MSHookMessageEx(iconMgrCls, setEditSel, (IMP)hook_mgr_setEditing, (IMP *)&orig_mgr_setEditing);
+        }
+        SEL setEditFromSel = NSSelectorFromString(@"setEditing:fromIconView:");
+        if ([iconMgrCls instancesRespondToSelector:setEditFromSel]) {
+            MSHookMessageEx(iconMgrCls, setEditFromSel, (IMP)hook_mgr_setEditingFromIconView, (IMP *)&orig_mgr_setEditingFromIconView);
+        }
+        SEL setEditFbSel = NSSelectorFromString(@"setEditing:withFeedbackBehavior:");
+        if ([iconMgrCls instancesRespondToSelector:setEditFbSel]) {
+            MSHookMessageEx(iconMgrCls, setEditFbSel, (IMP)hook_mgr_setEditingWithFeedback, (IMP *)&orig_mgr_setEditingWithFeedback);
+        }
     }
 
-    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.2 unclamped loop + native SBIconView + full jiggle guard)");
+    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.3 unclamped loop + native SBIconView + full setEditing guard)");
 }
 
 __attribute__((constructor))
 static void DockFlipEnhanceInit(void) {
-    os_log(DFELog(), "[DockFlipEnhance] initialized (v0.2.2)");
+    os_log(DFELog(), "[DockFlipEnhance] initialized (v0.2.3)");
     TryHookDockFlipController();
 
     if (!gHooked) {
