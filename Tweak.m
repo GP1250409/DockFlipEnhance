@@ -118,6 +118,29 @@ static UIView *DFEFindTemplateDockIconView(DockFlipController *ctrl) {
     return nil;
 }
 
+static const void *kDFENativeIconKey = &kDFENativeIconKey;
+static const void *kDFEIsDockFlipIconKey = &kDFEIsDockFlipIconKey;
+
+static void DFEDisableEditingLongPressOnIconView(UIView *iconView) {
+    if (!iconView) return;
+    @try {
+        SEL editGrSel = NSSelectorFromString(@"editingModeGestureRecognizer");
+        if ([iconView respondsToSelector:editGrSel]) {
+            UIGestureRecognizer *gr = ((id (*)(id, SEL))objc_msgSend)(iconView, editGrSel);
+            if ([gr isKindOfClass:[UIGestureRecognizer class]]) {
+                gr.enabled = NO;
+            }
+        }
+        Ivar ivar = class_getInstanceVariable(object_getClass(iconView), "_editingModeGestureRecognizer");
+        if (ivar) {
+            id obj = object_getIvar(iconView, ivar);
+            if ([obj isKindOfClass:[UIGestureRecognizer class]]) {
+                ((UIGestureRecognizer *)obj).enabled = NO;
+            }
+        }
+    } @catch (__unused NSException *ex) {}
+}
+
 static UIView *DFECreateNativeIconView(NSString *bundleID, CGRect targetBounds, UIView *templateIconView) {
     Class sbIconViewCls = NSClassFromString(@"SBIconView");
     if (!sbIconViewCls) return nil;
@@ -218,12 +241,14 @@ static UIView *DFECreateNativeIconView(NSString *bundleID, CGRect targetBounds, 
             }
         }
 
-        // 6. Disable drag-out interaction on DockFlip extra page so dragging never detaches from non-list superview
+        // 6. Disable drag-out interaction & long-hold jiggle/editing gesture on DockFlip extra page
         for (id<UIInteraction> inter in iconView.interactions) {
             if ([inter isKindOfClass:[UIDragInteraction class]]) {
                 ((UIDragInteraction *)inter).enabled = NO;
             }
         }
+        objc_setAssociatedObject(iconView, kDFEIsDockFlipIconKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        DFEDisableEditingLongPressOnIconView(iconView);
 
         return iconView;
     } @catch (NSException *ex) {
@@ -232,7 +257,25 @@ static UIView *DFECreateNativeIconView(NSString *bundleID, CGRect targetBounds, 
     }
 }
 
-static const void *kDFENativeIconKey = &kDFENativeIconKey;
+static void (*orig_editingModeGestureRecognizerDidFire)(id, SEL, id);
+static void hook_editingModeGestureRecognizerDidFire(id self, SEL _cmd, id recognizer) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        return;
+    }
+    if (orig_editingModeGestureRecognizerDidFire) {
+        orig_editingModeGestureRecognizerDidFire(self, _cmd, recognizer);
+    }
+}
+
+static void (*orig_handleEditingModeGesture)(id, SEL, id);
+static void hook_handleEditingModeGesture(id self, SEL _cmd, id recognizer) {
+    if (objc_getAssociatedObject(self, kDFEIsDockFlipIconKey)) {
+        return;
+    }
+    if (orig_handleEditingModeGesture) {
+        orig_handleEditingModeGesture(self, _cmd, recognizer);
+    }
+}
 
 static void DFEEnhancePageIcons(DockFlipController *ctrl) {
     UIView *page = ctrl.page;
@@ -456,12 +499,25 @@ static void TryHookDockFlipController(void) {
     MSHookMessageEx(cls, @selector(tick:), (IMP)hook_tick, (IMP *)&orig_tick);
     MSHookMessageEx(cls, @selector(rebuildPageWithList:), (IMP)hook_rebuildPageWithList, (IMP *)&orig_rebuildPageWithList);
 
-    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.0 unclamped loop + native SBIconView)");
+    // Block long-hold jiggle/editing mode strictly for DockFlip extra-page SBIconView proxies
+    Class sbIconViewCls = objc_getClass("SBIconView");
+    if (sbIconViewCls) {
+        SEL fireSel = NSSelectorFromString(@"editingModeGestureRecognizerDidFire:");
+        if ([sbIconViewCls instancesRespondToSelector:fireSel]) {
+            MSHookMessageEx(sbIconViewCls, fireSel, (IMP)hook_editingModeGestureRecognizerDidFire, (IMP *)&orig_editingModeGestureRecognizerDidFire);
+        }
+        SEL handleSel = NSSelectorFromString(@"_handleEditingModeGesture:");
+        if ([sbIconViewCls instancesRespondToSelector:handleSel]) {
+            MSHookMessageEx(sbIconViewCls, handleSel, (IMP)hook_handleEditingModeGesture, (IMP *)&orig_handleEditingModeGesture);
+        }
+    }
+
+    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.1 unclamped loop + native SBIconView without long-hold jiggle)");
 }
 
 __attribute__((constructor))
 static void DockFlipEnhanceInit(void) {
-    os_log(DFELog(), "[DockFlipEnhance] initialized (v0.2.0)");
+    os_log(DFELog(), "[DockFlipEnhance] initialized (v0.2.1)");
     TryHookDockFlipController();
 
     if (!gHooked) {
