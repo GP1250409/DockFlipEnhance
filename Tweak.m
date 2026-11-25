@@ -25,15 +25,30 @@
 @property (nonatomic, assign) double flightMin;
 @property (nonatomic, assign) double flightMax;
 @property (nonatomic, assign) BOOL listFaded;
+@property (nonatomic, strong) UIPanGestureRecognizer *pan;
+@property (nonatomic, strong) CALayer *listMask;
+@property (nonatomic, assign) CGRect platterRect;
+@property (nonatomic, assign) CGRect platterInList;
+@property (nonatomic, assign) double platterRadius;
 - (double)travel;
 - (void)applyProgress;
 - (void)stopSpring;
+- (void)springTo:(double)target velocity:(double)velocity;
 - (void)updateListMaskForShift:(double)shift list:(UIView *)list;
 - (void)rebuildPageWithList:(UIView *)list;
 - (double)progressForDragFrom:(double)start translation:(double)translation;
 - (double)targetForProgress:(double)progress velocity:(double)velocity;
 - (void)tick:(CADisplayLink *)link;
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer;
+- (void)handlePan:(UIPanGestureRecognizer *)pan;
 @end
+
+static BOOL DFEIsVerticalDock(DockFlipController *ctrl) {
+    UIView *ref = ctrl.page ?: ctrl.dock;
+    if (!ref) return NO;
+    CGRect b = ref.bounds;
+    return (b.size.height > b.size.width + 20.0);
+}
 
 // ============================================================================
 // Logging
@@ -443,6 +458,88 @@ static void hook_mgr_setEditingWithFeedback(id self, SEL _cmd, BOOL editing, id 
     }
 }
 
+static void DFERelayoutPageVerticallyIfNeeded(DockFlipController *ctrl, UIView *list) {
+    if (!DFEIsVerticalDock(ctrl)) return;
+    UIView *page = ctrl.page;
+    if (!page) return;
+
+    NSMutableArray<UIImageView *> *pageIcons = [NSMutableArray array];
+    for (UIView *sub in page.subviews) {
+        if ([sub isKindOfClass:[UIImageView class]] && sub.accessibilityIdentifier.length > 0) {
+            [pageIcons addObject:(UIImageView *)sub];
+        }
+    }
+    if (pageIcons.count == 0) return;
+    [pageIcons sortUsingComparator:^NSComparisonResult(UIImageView *a, UIImageView *b) {
+        if (a.tag < b.tag) return NSOrderedAscending;
+        if (a.tag > b.tag) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    // Collect native vertical Dock SBIconViews sorted top-to-bottom
+    NSMutableArray<UIView *> *nativeIcons = [NSMutableArray array];
+    Class sbIconViewCls = NSClassFromString(@"SBIconView");
+    UIView *iconList = list ?: ctrl.iconList;
+    if (iconList && sbIconViewCls) {
+        for (UIView *sub in iconList.subviews) {
+            if ([sub isKindOfClass:sbIconViewCls] && !sub.isHidden) {
+                [nativeIcons addObject:sub];
+            }
+        }
+    }
+    [nativeIcons sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+        CGFloat ya = CGRectGetMidY(a.frame);
+        CGFloat yb = CGRectGetMidY(b.frame);
+        if (ya < yb) return NSOrderedAscending;
+        if (ya > yb) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    CGFloat iconSize = 60.0;
+    CGFloat midX = CGRectGetMidX(page.bounds);
+    CGFloat firstMidY = 0.0;
+    CGFloat lastMidY = 0.0;
+
+    if (nativeIcons.count > 0) {
+        UIView *first = nativeIcons.firstObject;
+        UIView *last = nativeIcons.lastObject;
+        SEL imgFrameSel = NSSelectorFromString(@"iconImageFrame");
+        CGRect f1 = first.frame;
+        CGRect f2 = last.frame;
+        if ([first respondsToSelector:imgFrameSel]) {
+            CGRect imgF = ((CGRect (*)(id, SEL))objc_msgSend)(first, imgFrameSel);
+            if (imgF.size.width > 1.0) iconSize = imgF.size.width;
+            f1 = [page convertRect:imgF fromView:first];
+        } else if (f1.size.width > 1.0) {
+            iconSize = MIN(f1.size.width, f1.size.height);
+            f1 = [page convertRect:first.bounds fromView:first];
+        }
+        if ([last respondsToSelector:imgFrameSel]) {
+            CGRect imgF = ((CGRect (*)(id, SEL))objc_msgSend)(last, imgFrameSel);
+            f2 = [page convertRect:imgF fromView:last];
+        } else {
+            f2 = [page convertRect:last.bounds fromView:last];
+        }
+        midX = CGRectGetMidX(f1);
+        firstMidY = CGRectGetMidY(f1);
+        lastMidY = CGRectGetMidY(f2);
+    } else {
+        CGFloat h = page.bounds.size.height;
+        CGFloat pad = iconSize * 0.65;
+        firstMidY = pad;
+        lastMidY = MAX(pad, h - pad);
+    }
+
+    NSUInteger n = pageIcons.count;
+    for (NSUInteger i = 0; i < n; i++) {
+        UIImageView *iv = pageIcons[i];
+        CGFloat cy = (n == 1)
+            ? (firstMidY + lastMidY) * 0.5
+            : firstMidY + (lastMidY - firstMidY) * ((CGFloat)i / (CGFloat)(n - 1));
+        iv.frame = CGRectMake(round(midX - iconSize * 0.5), round(cy - iconSize * 0.5), iconSize, iconSize);
+    }
+}
+
 static void DFEEnhancePageIcons(DockFlipController *ctrl) {
     UIView *page = ctrl.page;
     if (!page) return;
@@ -487,11 +584,71 @@ static void DFEEnhancePageIcons(DockFlipController *ctrl) {
 // DockFlipController Hooks (Bidirectional Infinite Loop + Native Icon Embedding)
 // ============================================================================
 
+static double (*orig_travel)(DockFlipController *, SEL);
 static double (*orig_progressForDragFrom_translation)(DockFlipController *, SEL, double, double);
 static double (*orig_targetForProgress_velocity)(DockFlipController *, SEL, double, double);
 static void   (*orig_applyProgress)(DockFlipController *, SEL);
 static void   (*orig_tick)(DockFlipController *, SEL, CADisplayLink *);
 static void   (*orig_rebuildPageWithList)(DockFlipController *, SEL, UIView *);
+static BOOL   (*orig_gestureShouldBegin)(DockFlipController *, SEL, UIGestureRecognizer *);
+static void   (*orig_handlePan)(DockFlipController *, SEL, UIPanGestureRecognizer *);
+
+static double hook_travel(DockFlipController *self, SEL _cmd) {
+    if (DFEIsVerticalDock(self)) {
+        CGFloat h = CGRectGetHeight(self.platterRect);
+        if (h <= 0.0 && self.page) h = CGRectGetHeight(self.page.bounds);
+        if (h <= 0.0 && self.dock) h = CGRectGetHeight(self.dock.bounds);
+        return fmax(h, 80.0);
+    }
+    return orig_travel ? orig_travel(self, _cmd) : 80.0;
+}
+
+static BOOL hook_gestureShouldBegin(DockFlipController *self, SEL _cmd, UIGestureRecognizer *gr) {
+    if (gr == self.pan && DFEIsVerticalDock(self)) {
+        UIView *dock = self.dock;
+        if (!dock) return NO;
+        CGPoint t = [self.pan translationInView:dock];
+        CGPoint v = [self.pan velocityInView:dock];
+        CGFloat ax = fabs(t.x) > 0.5 ? fabs(t.x) : fabs(v.x);
+        CGFloat ay = fabs(t.y) > 0.5 ? fabs(t.y) : fabs(v.y);
+        return (ay >= ax);
+    }
+    return orig_gestureShouldBegin ? orig_gestureShouldBegin(self, _cmd, gr) : YES;
+}
+
+static void hook_handlePan(DockFlipController *self, SEL _cmd, UIPanGestureRecognizer *pan) {
+    if (!DFEIsVerticalDock(self)) {
+        if (orig_handlePan) orig_handlePan(self, _cmd, pan);
+        return;
+    }
+    UIView *dock = self.dock;
+    if (!dock) return;
+
+    UIGestureRecognizerState st = pan.state;
+    if (st == UIGestureRecognizerStateBegan) {
+        [self stopSpring];
+        self.panStartProgress = self.progress;
+        CGPoint t = [pan translationInView:dock];
+        self.progress = [self progressForDragFrom:self.panStartProgress translation:t.y];
+        [self applyProgress];
+    } else if (st == UIGestureRecognizerStateChanged) {
+        CGPoint t = [pan translationInView:dock];
+        self.progress = [self progressForDragFrom:self.panStartProgress translation:t.y];
+        [self applyProgress];
+    } else if (st == UIGestureRecognizerStateEnded) {
+        CGPoint t = [pan translationInView:dock];
+        self.progress = [self progressForDragFrom:self.panStartProgress translation:t.y];
+        [self applyProgress];
+        CGPoint v = [pan velocityInView:dock];
+        double travel = [self travel];
+        double velProg = (travel > 1.0) ? (-v.y / travel) : 0.0;
+        double target = [self targetForProgress:self.progress velocity:velProg];
+        [self springTo:target velocity:velProg];
+    } else if (st == UIGestureRecognizerStateCancelled || st == UIGestureRecognizerStateFailed) {
+        double target = round(self.panStartProgress);
+        [self springTo:target velocity:0.0];
+    }
+}
 
 // 1. Remove rubber-band clamping at 0 and 1 so user can swipe freely in either direction
 static double hook_progressForDragFrom_translation(DockFlipController *self, SEL _cmd, double start, double translation) {
@@ -550,16 +707,31 @@ static void hook_applyProgress(DockFlipController *self, SEL _cmd) {
         t = 1.0 - u;
     }
 
+    BOOL vertical = DFEIsVerticalDock(self);
+
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    iconList.layer.sublayerTransform = CATransform3DMakeTranslation(listShift, 0.0, 0.0);
-    [self updateListMaskForShift:listShift list:iconList];
+    if (vertical) {
+        iconList.layer.sublayerTransform = CATransform3DMakeTranslation(0.0, listShift, 0.0);
+        if (self.listMask) {
+            self.listMask.frame = CGRectOffset(self.platterInList, 0.0, -listShift);
+            self.listMask.cornerRadius = self.platterRadius;
+            if (iconList.layer.mask != self.listMask) {
+                iconList.layer.mask = self.listMask;
+            }
+        }
+    } else {
+        iconList.layer.sublayerTransform = CATransform3DMakeTranslation(listShift, 0.0, 0.0);
+        [self updateListMaskForShift:listShift list:iconList];
+    }
     [CATransaction commit];
 
     iconList.alpha = 1.0 - t;
     self.listFaded = (t > 0.001);
 
-    page.transform = CGAffineTransformMakeTranslation(pageShift, 0.0);
+    page.transform = vertical
+        ? CGAffineTransformMakeTranslation(0.0, pageShift)
+        : CGAffineTransformMakeTranslation(pageShift, 0.0);
     page.alpha = t;
     if (clip) {
         clip.hidden = (t < 0.001);
@@ -644,6 +816,7 @@ static void hook_tick(DockFlipController *self, SEL _cmd, CADisplayLink *link) {
 // 5. Enhance extra-page icons whenever DockFlip rebuilds the page
 static void hook_rebuildPageWithList(DockFlipController *self, SEL _cmd, UIView *list) {
     orig_rebuildPageWithList(self, _cmd, list);
+    DFERelayoutPageVerticallyIfNeeded(self, list);
     DFEEnhancePageIcons(self);
 }
 
@@ -659,6 +832,9 @@ static void TryHookDockFlipController(void) {
     if (!cls) return;
 
     gHooked = YES;
+    MSHookMessageEx(cls, @selector(travel), (IMP)hook_travel, (IMP *)&orig_travel);
+    MSHookMessageEx(cls, @selector(gestureRecognizerShouldBegin:), (IMP)hook_gestureShouldBegin, (IMP *)&orig_gestureShouldBegin);
+    MSHookMessageEx(cls, @selector(handlePan:), (IMP)hook_handlePan, (IMP *)&orig_handlePan);
     MSHookMessageEx(cls, @selector(progressForDragFrom:translation:), (IMP)hook_progressForDragFrom_translation, (IMP *)&orig_progressForDragFrom_translation);
     MSHookMessageEx(cls, @selector(targetForProgress:velocity:), (IMP)hook_targetForProgress_velocity, (IMP *)&orig_targetForProgress_velocity);
     MSHookMessageEx(cls, @selector(applyProgress), (IMP)hook_applyProgress, (IMP *)&orig_applyProgress);
