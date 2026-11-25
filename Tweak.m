@@ -220,21 +220,26 @@ static const void *kDFEBundleIDKey = &kDFEBundleIDKey;
 
 static void DFEOpenApplication(NSString *bundleID) {
     if (bundleID.length == 0) return;
-    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
-    SEL defaultSel = NSSelectorFromString(@"defaultWorkspace");
-    SEL openSel = NSSelectorFromString(@"openApplicationWithBundleID:");
-    if (wsCls && [wsCls respondsToSelector:defaultSel]) {
-        id ws = ((id (*)(id, SEL))objc_msgSend)(wsCls, defaultSel);
-        if (ws && [ws respondsToSelector:openSel]) {
-            BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, openSel, bundleID);
-            if (ok) return;
-        }
-    }
+    // Prefer in-process SpringBoard launch (0ms instant, no Home Screen page jump, no main-thread XPC deadlock)
     UIApplication *app = [UIApplication sharedApplication];
     SEL launchSel = NSSelectorFromString(@"launchApplicationWithIdentifier:suspended:");
     if ([app respondsToSelector:launchSel]) {
-        ((void (*)(id, SEL, id, BOOL))objc_msgSend)(app, launchSel, bundleID, NO);
+        BOOL ok = ((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(app, launchSel, bundleID, NO);
+        if (ok) return;
     }
+    // Fallback asynchronously off the main thread so LSApplicationWorkspace never blocks SpringBoard
+    NSString *bidCopy = [bundleID copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+        SEL defaultSel = NSSelectorFromString(@"defaultWorkspace");
+        SEL openSel = NSSelectorFromString(@"openApplicationWithBundleID:");
+        if (wsCls && [wsCls respondsToSelector:defaultSel]) {
+            id ws = ((id (*)(id, SEL))objc_msgSend)(wsCls, defaultSel);
+            if (ws && [ws respondsToSelector:openSel]) {
+                ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, openSel, bidCopy);
+            }
+        }
+    });
 }
 
 static NSString *DFEBundleIDForIconView(id iconView) {
