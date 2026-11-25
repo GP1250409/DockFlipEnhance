@@ -70,7 +70,7 @@ jobs:
           cat > control << 'EOF'
           Package: cc.gonepaul.dockflipenhance.rootless
           Name: DockFlip 增强补丁 (Rootless)
-          Version: 0.2.10
+          Version: 0.2.11
           Architecture: iphoneos-arm64
           Description: Enhances DockFlip with smooth bidirectional infinite dock paging and native SBIconView long-press Quick Actions / AppData / Choicy support on extra page icons (Dopamine Rootless iOS 16 arm64).
           Maintainer: Paul

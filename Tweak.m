@@ -111,6 +111,7 @@ static void DFETunePanForOrientation(DockFlipController *ctrl, BOOL vertical) {
     if (pan) {
         gDFEDockPan = pan;
         pan.cancelsTouchesInView = YES;
+        pan.delaysTouchesBegan = vertical;
         SEL hystSel = NSSelectorFromString(@"_setHysteresis:");
         if ([pan respondsToSelector:hystSel]) {
             ((void (*)(id, SEL, double))objc_msgSend)(pan, hystSel, vertical ? 4.0 : 10.0);
@@ -704,6 +705,18 @@ static BOOL hook_shouldRequireFailure(DockFlipController *self, SEL _cmd, UIGest
     return orig_shouldRequireFailure ? orig_shouldRequireFailure(self, _cmd, gr, other) : NO;
 }
 
+static BOOL   (*orig_shouldRecognizeSimultaneously)(DockFlipController *, SEL, UIGestureRecognizer *, UIGestureRecognizer *);
+
+static BOOL hook_shouldRecognizeSimultaneously(DockFlipController *self, SEL _cmd, UIGestureRecognizer *gr, UIGestureRecognizer *other) {
+    if (gr == self.pan && DFEIsVerticalDock(self) && other && self.dock && other.view) {
+        // Allow vertical dock pan to start immediately even if 3D Touch / press / context-menu recognizer on an icon is tracking
+        if ([other.view isDescendantOfView:self.dock] && ![other isKindOfClass:[UIPanGestureRecognizer class]]) {
+            return YES;
+        }
+    }
+    return orig_shouldRecognizeSimultaneously ? orig_shouldRecognizeSimultaneously(self, _cmd, gr, other) : NO;
+}
+
 static void   (*orig_handlePan)(DockFlipController *, SEL, UIPanGestureRecognizer *);
 
 static double hook_travel(DockFlipController *self, SEL _cmd) {
@@ -985,6 +998,12 @@ static void TryHookDockFlipController(void) {
         MSHookMessageEx(cls, reqFailSel, (IMP)hook_shouldRequireFailure, (IMP *)&orig_shouldRequireFailure);
     } else {
         class_addMethod(cls, reqFailSel, (IMP)hook_shouldRequireFailure, "B@:@@");
+    }
+    SEL simSel = @selector(gestureRecognizer:shouldRecognizeSimultaneouslyWithGestureRecognizer:);
+    if ([cls instancesRespondToSelector:simSel]) {
+        MSHookMessageEx(cls, simSel, (IMP)hook_shouldRecognizeSimultaneously, (IMP *)&orig_shouldRecognizeSimultaneously);
+    } else {
+        class_addMethod(cls, simSel, (IMP)hook_shouldRecognizeSimultaneously, "B@:@@");
     }
     MSHookMessageEx(cls, @selector(handlePan:), (IMP)hook_handlePan, (IMP *)&orig_handlePan);
     MSHookMessageEx(cls, @selector(progressForDragFrom:translation:), (IMP)hook_progressForDragFrom_translation, (IMP *)&orig_progressForDragFrom_translation);
