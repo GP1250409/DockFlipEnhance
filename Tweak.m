@@ -10,10 +10,6 @@
 // Runtime Forward Declarations (No Private Headers Required)
 // ============================================================================
 
-@interface UIView (DFEPrivate)
-- (UIViewController *)_viewControllerForAncestor;
-@end
-
 @interface DockFlipController : NSObject
 @property (nonatomic, weak) UIView *dock;
 @property (nonatomic, weak) UIView *iconList;
@@ -25,9 +21,13 @@
 @property (nonatomic, assign) double target;
 @property (nonatomic, assign) double velocity;
 @property (nonatomic, assign) double panStartProgress;
+@property (nonatomic, assign) double lastTimestamp;
+@property (nonatomic, assign) double flightMin;
+@property (nonatomic, assign) double flightMax;
 @property (nonatomic, assign) BOOL listFaded;
 - (double)travel;
 - (void)applyProgress;
+- (void)stopSpring;
 - (void)updateListMaskForShift:(double)shift list:(UIView *)list;
 - (void)rebuildPageWithList:(UIView *)list;
 - (double)progressForDragFrom:(double)start translation:(double)translation;
@@ -49,34 +49,19 @@ static os_log_t DFELog(void) {
 }
 
 // ============================================================================
-// SpringBoard / AppData / Quick Actions Helpers
+// SpringBoard SBIcon / SBIconView Helpers
 // ============================================================================
 
-static UIViewController *DFETopPresenterForView(UIView *sourceView) {
-    UIViewController *vc = nil;
-    if ([sourceView respondsToSelector:@selector(_viewControllerForAncestor)]) {
-        vc = [sourceView _viewControllerForAncestor];
+static id DFEIconManager(void) {
+    Class iconCtrlCls = NSClassFromString(@"SBIconController");
+    if (!iconCtrlCls || ![iconCtrlCls respondsToSelector:@selector(sharedInstance)]) return nil;
+    id iconCtrl = ((id (*)(id, SEL))objc_msgSend)(iconCtrlCls, @selector(sharedInstance));
+    if (!iconCtrl) return nil;
+    SEL mgrSel = NSSelectorFromString(@"iconManager");
+    if ([iconCtrl respondsToSelector:mgrSel]) {
+        return ((id (*)(id, SEL))objc_msgSend)(iconCtrl, mgrSel);
     }
-    if (!vc) {
-        vc = sourceView.window.rootViewController;
-    }
-    if (!vc) {
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindowScene *ws = (UIWindowScene *)scene;
-            for (UIWindow *w in ws.windows) {
-                if (w.isKeyWindow && w.rootViewController) {
-                    vc = w.rootViewController;
-                    break;
-                }
-            }
-            if (vc) break;
-        }
-    }
-    while (vc.presentedViewController && !vc.presentedViewController.isBeingDismissed) {
-        vc = vc.presentedViewController;
-    }
-    return vc;
+    return nil;
 }
 
 static id DFEFindSBIconForBundleID(NSString *bundleID) {
@@ -120,361 +105,140 @@ static id DFEFindSBIconForBundleID(NSString *bundleID) {
     return nil;
 }
 
-static UIView *DFEFindSBIconViewForBundleID(NSString *bundleID) {
-    id icon = DFEFindSBIconForBundleID(bundleID);
-    if (!icon) return nil;
-    Class iconCtrlCls = NSClassFromString(@"SBIconController");
-    if (!iconCtrlCls || ![iconCtrlCls respondsToSelector:@selector(sharedInstance)]) return nil;
-    id iconCtrl = ((id (*)(id, SEL))objc_msgSend)(iconCtrlCls, @selector(sharedInstance));
-    SEL iconManagerSel = NSSelectorFromString(@"iconManager");
-    if (!iconCtrl || ![iconCtrl respondsToSelector:iconManagerSel]) return nil;
-    id mgr = ((id (*)(id, SEL))objc_msgSend)(iconCtrl, iconManagerSel);
-    if (!mgr) return nil;
-
-    SEL displayedSel = NSSelectorFromString(@"displayedIconViewForIcon:");
-    if ([mgr respondsToSelector:displayedSel]) {
-        id v = ((id (*)(id, SEL, id))objc_msgSend)(mgr, displayedSel, icon);
-        if ([v isKindOfClass:[UIView class]]) return (UIView *)v;
-    }
-    SEL firstSel = NSSelectorFromString(@"firstIconViewForIcon:");
-    if ([mgr respondsToSelector:firstSel]) {
-        id v = ((id (*)(id, SEL, id))objc_msgSend)(mgr, firstSel, icon);
-        if ([v isKindOfClass:[UIView class]]) return (UIView *)v;
+static UIView *DFEFindTemplateDockIconView(DockFlipController *ctrl) {
+    UIView *list = ctrl.iconList;
+    if (!list) return nil;
+    Class sbIconViewCls = NSClassFromString(@"SBIconView");
+    if (!sbIconViewCls) return nil;
+    for (UIView *sub in list.subviews) {
+        if ([sub isKindOfClass:sbIconViewCls]) {
+            return sub;
+        }
     }
     return nil;
 }
 
-static NSString *DFEAppDisplayName(NSString *bundleID) {
-    if (bundleID.length == 0) return @"";
-    id icon = DFEFindSBIconForBundleID(bundleID);
-    if (icon && [icon respondsToSelector:@selector(displayName)]) {
-        NSString *name = ((id (*)(id, SEL))objc_msgSend)(icon, @selector(displayName));
-        if (name.length > 0) return name;
-    }
-    Class proxyCls = NSClassFromString(@"LSApplicationProxy");
-    SEL proxySel = NSSelectorFromString(@"applicationProxyForIdentifier:");
-    if (proxyCls && [proxyCls respondsToSelector:proxySel]) {
-        id proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxyCls, proxySel, bundleID);
-        SEL locNameSel = NSSelectorFromString(@"localizedName");
-        if (proxy && [proxy respondsToSelector:locNameSel]) {
-            NSString *name = ((id (*)(id, SEL))objc_msgSend)(proxy, locNameSel);
-            if (name.length > 0) return name;
-        }
-    }
-    return bundleID;
-}
+static UIView *DFECreateNativeIconView(NSString *bundleID, CGRect targetBounds, UIView *templateIconView) {
+    Class sbIconViewCls = NSClassFromString(@"SBIconView");
+    if (!sbIconViewCls) return nil;
 
-static void DFEOpenApplication(NSString *bundleID) {
-    if (bundleID.length == 0) return;
-    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
-    SEL defaultSel = NSSelectorFromString(@"defaultWorkspace");
-    SEL openSel = NSSelectorFromString(@"openApplicationWithBundleID:");
-    if (wsCls && [wsCls respondsToSelector:defaultSel]) {
-        id ws = ((id (*)(id, SEL))objc_msgSend)(wsCls, defaultSel);
-        if (ws && [ws respondsToSelector:openSel]) {
-            BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, openSel, bundleID);
-            if (ok) return;
-        }
-    }
-    UIApplication *app = [UIApplication sharedApplication];
-    SEL launchSel = NSSelectorFromString(@"launchApplicationWithIdentifier:suspended:");
-    if ([app respondsToSelector:launchSel]) {
-        ((void (*)(id, SEL, id, BOOL))objc_msgSend)(app, launchSel, bundleID, NO);
-    }
-}
-
-static BOOL DFEIsAppDataAvailable(void) {
-    return (NSClassFromString(@"ADAppData") != nil && NSClassFromString(@"ADDataViewController") != nil);
-}
-
-static void DFEPresentAppData(NSString *bundleID, UIImage *iconImage, UIView *sourceView, BOOL fromContextMenu) {
-    if (bundleID.length == 0 || !DFEIsAppDataAvailable()) return;
-
-    void (^presentBlock)(void) = ^{
-        @try {
-            Class adAppDataCls = NSClassFromString(@"ADAppData");
-            Class adVCCLS = NSClassFromString(@"ADDataViewController");
-            SEL makeSel = NSSelectorFromString(@"appDataForBundleIdentifier:iconImage:");
-            SEL initSel = NSSelectorFromString(@"initWithAppData:");
-            if (![adAppDataCls respondsToSelector:makeSel]) return;
-
-            id appData = ((id (*)(id, SEL, id, id))objc_msgSend)(adAppDataCls, makeSel, bundleID, iconImage);
-            if (!appData) return;
-
-            UIView *realIconView = DFEFindSBIconViewForBundleID(bundleID);
-            SEL setIconViewSel = NSSelectorFromString(@"setIconView:");
-            if (realIconView && [appData respondsToSelector:setIconViewSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(appData, setIconViewSel, realIconView);
-            }
-
-            UISelectionFeedbackGenerator *feedback = [[UISelectionFeedbackGenerator alloc] init];
-            [feedback selectionChanged];
-
-            UIViewController *adVC = ((id (*)(id, SEL, id))objc_msgSend)([adVCCLS alloc], initSel, appData);
-            if (!adVC) return;
-
-            UIViewController *presenter = DFETopPresenterForView(sourceView);
-            if (presenter) {
-                [presenter presentViewController:adVC animated:YES completion:nil];
-            } else {
-                os_log_error(DFELog(), "No presenter found for AppData (%{public}@)", bundleID);
-            }
-        } @catch (NSException *ex) {
-            os_log_error(DFELog(), "AppData presentation failed for %{public}@: %{public}@", bundleID, ex.reason);
-        }
-    };
-
-    if (fromContextMenu) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)), dispatch_get_main_queue(), presentBlock);
-    } else {
-        dispatch_async(dispatch_get_main_queue(), presentBlock);
-    }
-}
-
-// ============================================================================
-// Quick Action Activation (Native SpringBoard Shortcut Execution)
-// ============================================================================
-
-static void DFEActivateShortcutItem(id sbsShortcutItem, NSString *bundleID) {
-    if (!sbsShortcutItem || bundleID.length == 0) {
-        DFEOpenApplication(bundleID);
-        return;
-    }
+    id sbIcon = DFEFindSBIconForBundleID(bundleID);
+    if (!sbIcon) return nil;
 
     @try {
-        // Path 1: Native SBIconView +activateShortcut:withBundleIdentifier:forIconView:
-        Class sbIconViewCls = NSClassFromString(@"SBIconView");
-        SEL activateSel = NSSelectorFromString(@"activateShortcut:withBundleIdentifier:forIconView:");
-        UIView *realIconView = DFEFindSBIconViewForBundleID(bundleID);
-        if (sbIconViewCls && realIconView && [sbIconViewCls respondsToSelector:activateSel]) {
-            ((void (*)(id, SEL, id, id, id))objc_msgSend)(sbIconViewCls, activateSel, sbsShortcutItem, bundleID, realIconView);
-            return;
+        UIView *iconView = nil;
+
+        // 1. Initialize using same configurationOptions as native Dock SBIconView
+        SEL cfgOptsSel = NSSelectorFromString(@"configurationOptions");
+        SEL initCfgSel = NSSelectorFromString(@"initWithConfigurationOptions:");
+        if ([sbIconViewCls instancesRespondToSelector:initCfgSel]) {
+            NSUInteger opts = 0;
+            if (templateIconView && [templateIconView respondsToSelector:cfgOptsSel]) {
+                opts = ((NSUInteger (*)(id, SEL))objc_msgSend)(templateIconView, cfgOptsSel);
+            }
+            iconView = ((id (*)(id, SEL, NSUInteger))objc_msgSend)([sbIconViewCls alloc], initCfgSel, opts);
+        }
+        if (!iconView) {
+            iconView = [[sbIconViewCls alloc] initWithFrame:targetBounds];
+        }
+        if (!iconView) return nil;
+
+        // 2. Copy delegate (SBHIconManager), location (SBIconLocationDock), and listLayoutProvider
+        id delegate = nil;
+        SEL delegateSel = NSSelectorFromString(@"delegate");
+        SEL setDelegateSel = NSSelectorFromString(@"setDelegate:");
+        if (templateIconView && [templateIconView respondsToSelector:delegateSel]) {
+            delegate = ((id (*)(id, SEL))objc_msgSend)(templateIconView, delegateSel);
+        }
+        if (!delegate) {
+            delegate = DFEIconManager();
+        }
+        if (delegate && [iconView respondsToSelector:setDelegateSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(iconView, setDelegateSel, delegate);
         }
 
-        // Path 2: Launch via FBSSystemService with UIApplicationShortcutAction
-        Class actionCls = NSClassFromString(@"UIApplicationShortcutAction");
-        SEL initWithItemSel = NSSelectorFromString(@"initWithShortcutItem:");
-        id action = nil;
-        if (actionCls && [actionCls instancesRespondToSelector:initWithItemSel]) {
-            action = ((id (*)(id, SEL, id))objc_msgSend)([actionCls alloc], initWithItemSel, sbsShortcutItem);
-        }
-
-        Class fbsCls = NSClassFromString(@"FBSSystemService");
-        SEL sharedSvcSel = NSSelectorFromString(@"sharedService");
-        SEL openAppSel = NSSelectorFromString(@"openApplication:options:withResult:");
-        if (action && fbsCls && [fbsCls respondsToSelector:sharedSvcSel]) {
-            id svc = ((id (*)(id, SEL))objc_msgSend)(fbsCls, sharedSvcSel);
-            if (svc && [svc respondsToSelector:openAppSel]) {
-                NSDictionary *options = @{
-                    @"__Actions": @[action],
-                    @"__ActivateSuspended": @NO
-                };
-                void (^resultBlock)(NSError *) = ^(NSError *err) {
-                    if (err) {
-                        os_log_error(DFELog(), "FBSSystemService shortcut open failed: %{public}@", err);
-                    }
-                };
-                ((void (*)(id, SEL, id, id, id))objc_msgSend)(svc, openAppSel, bundleID, options, resultBlock);
-                return;
+        SEL listLayoutProvSel = NSSelectorFromString(@"listLayoutProvider");
+        SEL setListLayoutProvSel = NSSelectorFromString(@"setListLayoutProvider:");
+        if (templateIconView && [templateIconView respondsToSelector:listLayoutProvSel] && [iconView respondsToSelector:setListLayoutProvSel]) {
+            id prov = ((id (*)(id, SEL))objc_msgSend)(templateIconView, listLayoutProvSel);
+            if (prov) {
+                ((void (*)(id, SEL, id))objc_msgSend)(iconView, setListLayoutProvSel, prov);
             }
         }
 
-        // Path 3: Call SBIconView +activateShortcut:withBundleIdentifier:forIconView: with nil iconView
-        if (sbIconViewCls && [sbIconViewCls respondsToSelector:activateSel]) {
-            ((void (*)(id, SEL, id, id, id))objc_msgSend)(sbIconViewCls, activateSel, sbsShortcutItem, bundleID, nil);
-            return;
+        SEL locSel = NSSelectorFromString(@"location");
+        SEL setLocSel = NSSelectorFromString(@"setLocation:");
+        NSString *loc = @"SBIconLocationDock";
+        if (templateIconView && [templateIconView respondsToSelector:locSel]) {
+            id tLoc = ((id (*)(id, SEL))objc_msgSend)(templateIconView, locSel);
+            if ([tLoc isKindOfClass:[NSString class]] && ((NSString *)tLoc).length > 0) {
+                loc = (NSString *)tLoc;
+            }
         }
+        if ([iconView respondsToSelector:setLocSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(iconView, setLocSel, loc);
+        }
+
+        // 3. Configure dock appearance (no label; no duplicate badge so DockFlipBadge stays authoritative)
+        SEL setAllowsLabelSel = NSSelectorFromString(@"setAllowsLabelArea:");
+        if ([iconView respondsToSelector:setAllowsLabelSel]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(iconView, setAllowsLabelSel, NO);
+        }
+        SEL setLabelHiddenSel = NSSelectorFromString(@"setLabelHidden:");
+        if ([iconView respondsToSelector:setLabelHiddenSel]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(iconView, setLabelHiddenSel, YES);
+        }
+        SEL setAllowsAccSel = NSSelectorFromString(@"setAllowsAccessoryView:");
+        if ([iconView respondsToSelector:setAllowsAccSel]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(iconView, setAllowsAccSel, NO);
+        }
+        SEL setAllowsCloseSel = NSSelectorFromString(@"setAllowsCloseBox:");
+        if ([iconView respondsToSelector:setAllowsCloseSel]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(iconView, setAllowsCloseSel, NO);
+        }
+
+        // 4. Bind the real SBApplicationIcon
+        SEL setIconSel = NSSelectorFromString(@"setIcon:");
+        if ([iconView respondsToSelector:setIconSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(iconView, setIconSel, sbIcon);
+        }
+
+        // 5. Align iconView frame so its iconImageFrame sits 1:1 over DockFlip's icon rect
+        iconView.frame = targetBounds;
+        [iconView layoutIfNeeded];
+        SEL imgFrameSel = NSSelectorFromString(@"iconImageFrame");
+        if ([iconView respondsToSelector:imgFrameSel]) {
+            CGRect imgFrame = ((CGRect (*)(id, SEL))objc_msgSend)(iconView, imgFrameSel);
+            if (imgFrame.size.width > 1.0 && imgFrame.size.height > 1.0) {
+                CGFloat dx = CGRectGetMidX(targetBounds) - CGRectGetMidX(imgFrame);
+                CGFloat dy = CGRectGetMidY(targetBounds) - CGRectGetMidY(imgFrame);
+                if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
+                    iconView.frame = CGRectOffset(iconView.frame, dx, dy);
+                }
+            }
+        }
+
+        // 6. Disable drag-out interaction on DockFlip extra page so dragging never detaches from non-list superview
+        for (id<UIInteraction> inter in iconView.interactions) {
+            if ([inter isKindOfClass:[UIDragInteraction class]]) {
+                ((UIDragInteraction *)inter).enabled = NO;
+            }
+        }
+
+        return iconView;
     } @catch (NSException *ex) {
-        os_log_error(DFELog(), "Shortcut activation exception for %{public}@: %{public}@", bundleID, ex.reason);
+        os_log_error(DFELog(), "Failed creating SBIconView for %{public}@: %{public}@", bundleID, ex.reason);
+        return nil;
     }
-
-    DFEOpenApplication(bundleID);
 }
 
-static UIImage *DFEImageForSBSShortcutItem(id sbsItem) {
-    if (!sbsItem) return nil;
-    @try {
-        SEL iconSel = NSSelectorFromString(@"icon");
-        if (![sbsItem respondsToSelector:iconSel]) return nil;
-        id iconObj = ((id (*)(id, SEL))objc_msgSend)(sbsItem, iconSel);
-        if (!iconObj) return nil;
-
-        SEL sysImgSel = NSSelectorFromString(@"systemImageName");
-        if ([iconObj respondsToSelector:sysImgSel]) {
-            NSString *sym = ((id (*)(id, SEL))objc_msgSend)(iconObj, sysImgSel);
-            if (sym.length > 0) {
-                UIImage *img = [UIImage systemImageNamed:sym];
-                if (img) return img;
-            }
-        }
-        SEL nameSel = NSSelectorFromString(@"name");
-        if ([iconObj respondsToSelector:nameSel]) {
-            NSString *sym = ((id (*)(id, SEL))objc_msgSend)(iconObj, nameSel);
-            if (sym.length > 0) {
-                UIImage *img = [UIImage systemImageNamed:sym];
-                if (img) return img;
-            }
-        }
-    } @catch (__unused NSException *ex) {}
-    return [UIImage systemImageNamed:@"arrow.up.forward.app"];
-}
-
-// ============================================================================
-// Per-Icon Interaction Delegate (Swipe Up -> AppData, Long Press -> Context Menu)
-// ============================================================================
-
-@interface DFEIconInteractionHandler : NSObject <UIContextMenuInteractionDelegate, UIGestureRecognizerDelegate>
-@property (nonatomic, copy) NSString *bundleID;
-@property (nonatomic, weak) UIImageView *iconView;
-@property (nonatomic, strong) UIContextMenuInteraction *contextMenuInteraction;
-@property (nonatomic, strong) UISwipeGestureRecognizer *swipeUpGesture;
-@end
-
-@implementation DFEIconInteractionHandler
-
-- (void)handleSwipeUp:(UISwipeGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateEnded) return;
-    if (!self.iconView || self.bundleID.length == 0) return;
-    DFEPresentAppData(self.bundleID, self.iconView.image, self.iconView, NO);
-}
-
-- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction
-                        configurationForMenuAtLocation:(CGPoint)location {
-    NSString *bundleID = [self.bundleID copy];
-    __weak UIImageView *weakIconView = self.iconView;
-    if (bundleID.length == 0) return nil;
-
-    return [UIContextMenuConfiguration configurationWithIdentifier:bundleID
-                                                   previewProvider:nil
-                                                    actionProvider:^UIMenu * _Nullable(NSArray<UIMenuElement *> * _Nonnull suggestedActions) {
-        NSMutableArray<UIMenuElement *> *elements = [NSMutableArray array];
-
-        // 1. Dynamic + Static native Quick Actions via SBSApplicationShortcutService
-        UIDeferredMenuElement *shortcutSection = [UIDeferredMenuElement elementWithUncachedProvider:^(void (^ _Nonnull completion)(NSArray<UIMenuElement *> * _Nonnull)) {
-            Class svcCls = NSClassFromString(@"SBSApplicationShortcutService");
-            SEL fetchSel = NSSelectorFromString(@"fetchApplicationShortcutItemsOfTypes:forBundleIdentifier:withCompletionHandler:");
-            if (!svcCls || ![svcCls instancesRespondToSelector:fetchSel]) {
-                completion(@[]);
-                return;
-            }
-
-            @try {
-                id svc = [[svcCls alloc] init];
-                // types = 0x3 (static + dynamic)
-                void (^handler)(id) = ^(id result) {
-                    NSMutableArray<id> *items = [NSMutableArray array];
-                    if ([result isKindOfClass:[NSArray class]]) {
-                        [items addObjectsFromArray:(NSArray *)result];
-                    } else if (result) {
-                        SEL staticSel = NSSelectorFromString(@"applicationShortcutItems");
-                        SEL dynSel = NSSelectorFromString(@"dynamicApplicationShortcutItems");
-                        SEL bestStaticSel = NSSelectorFromString(@"bestStaticApplicationShortcutItems");
-                        if ([result respondsToSelector:bestStaticSel]) {
-                            NSArray *a = ((id (*)(id, SEL))objc_msgSend)(result, bestStaticSel);
-                            if ([a isKindOfClass:[NSArray class]]) [items addObjectsFromArray:a];
-                        } else if ([result respondsToSelector:staticSel]) {
-                            NSArray *a = ((id (*)(id, SEL))objc_msgSend)(result, staticSel);
-                            if ([a isKindOfClass:[NSArray class]]) [items addObjectsFromArray:a];
-                        }
-                        if ([result respondsToSelector:dynSel]) {
-                            NSArray *a = ((id (*)(id, SEL))objc_msgSend)(result, dynSel);
-                            if ([a isKindOfClass:[NSArray class]]) [items addObjectsFromArray:a];
-                        }
-                    }
-
-                    NSMutableArray<UIMenuElement *> *actions = [NSMutableArray array];
-                    NSMutableSet<NSString *> *seen = [NSMutableSet set];
-                    SEL titleSel = NSSelectorFromString(@"localizedTitle");
-                    SEL subtitleSel = NSSelectorFromString(@"localizedSubtitle");
-                    SEL typeSel = NSSelectorFromString(@"type");
-
-                    for (id item in items) {
-                        NSString *title = [item respondsToSelector:titleSel]
-                            ? ((id (*)(id, SEL))objc_msgSend)(item, titleSel)
-                            : nil;
-                        if (title.length == 0) continue;
-                        NSString *typeStr = [item respondsToSelector:typeSel]
-                            ? (((id (*)(id, SEL))objc_msgSend)(item, typeSel) ?: @"")
-                            : @"";
-                        NSString *dedupKey = [NSString stringWithFormat:@"%@|%@", typeStr, title];
-                        if ([seen containsObject:dedupKey]) continue;
-                        [seen addObject:dedupKey];
-
-                        UIImage *img = DFEImageForSBSShortcutItem(item);
-                        UIAction *act = [UIAction actionWithTitle:title
-                                                            image:img
-                                                       identifier:nil
-                                                          handler:^(__kindof UIAction * _Nonnull action) {
-                            DFEActivateShortcutItem(item, bundleID);
-                        }];
-                        if ([item respondsToSelector:subtitleSel]) {
-                            NSString *sub = ((id (*)(id, SEL))objc_msgSend)(item, subtitleSel);
-                            if (sub.length > 0 && [act respondsToSelector:@selector(setDiscoverabilityTitle:)]) {
-                                act.discoverabilityTitle = sub;
-                            }
-                        }
-                        [actions addObject:act];
-                    }
-
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        completion(actions);
-                    });
-                };
-
-                ((void (*)(id, SEL, NSUInteger, id, id))objc_msgSend)(svc, fetchSel, 3, bundleID, handler);
-            } @catch (NSException *ex) {
-                os_log_error(DFELog(), "Failed fetching shortcuts for %{public}@: %{public}@", bundleID, ex.reason);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    completion(@[]);
-                });
-            }
-        }];
-        [elements addObject:shortcutSection];
-
-        // 2. AppData action (when AppData tweak is installed)
-        if (DFEIsAppDataAvailable()) {
-            UIAction *appDataAction = [UIAction actionWithTitle:@"AppData"
-                                                          image:[UIImage systemImageNamed:@"info.circle"]
-                                                     identifier:nil
-                                                        handler:^(__kindof UIAction * _Nonnull action) {
-                UIImageView *iv = weakIconView;
-                DFEPresentAppData(bundleID, iv.image, iv, YES);
-            }];
-            [elements addObject:appDataAction];
-        }
-
-        // 3. Fallback Open App action so menu is never empty even if app has no shortcuts & no AppData
-        UIAction *openAction = [UIAction actionWithTitle:@"打开 App"
-                                                   image:[UIImage systemImageNamed:@"arrow.up.forward.square"]
-                                              identifier:nil
-                                                 handler:^(__kindof UIAction * _Nonnull action) {
-            DFEOpenApplication(bundleID);
-        }];
-        [elements addObject:openAction];
-
-        NSString *appName = DFEAppDisplayName(bundleID);
-        return [UIMenu menuWithTitle:appName children:elements];
-    }];
-}
-
-- (UITargetedPreview *)contextMenuInteraction:(UIContextMenuInteraction *)interaction
-    previewForHighlightingMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {
-    UIImageView *iv = self.iconView;
-    if (!iv || !iv.window) return nil;
-    UIPreviewParameters *params = [[UIPreviewParameters alloc] init];
-    params.backgroundColor = [UIColor clearColor];
-    CGFloat radius = MIN(iv.bounds.size.width, iv.bounds.size.height) * 0.225;
-    params.visiblePath = [UIBezierPath bezierPathWithRoundedRect:iv.bounds cornerRadius:radius];
-    return [[UITargetedPreview alloc] initWithView:iv parameters:params];
-}
-
-@end
-
-static const void *kDFEHandlerKey = &kDFEHandlerKey;
+static const void *kDFENativeIconKey = &kDFENativeIconKey;
 
 static void DFEEnhancePageIcons(DockFlipController *ctrl) {
     UIView *page = ctrl.page;
     if (!page) return;
+
+    UIView *templateIconView = DFEFindTemplateDockIconView(ctrl);
 
     for (UIView *sub in page.subviews) {
         if (![sub isKindOfClass:[UIImageView class]]) continue;
@@ -482,43 +246,36 @@ static void DFEEnhancePageIcons(DockFlipController *ctrl) {
         NSString *bundleID = iv.accessibilityIdentifier;
         if (bundleID.length == 0) continue;
 
-        DFEIconInteractionHandler *existing = objc_getAssociatedObject(iv, kDFEHandlerKey);
-        if (existing) {
-            existing.bundleID = bundleID;
+        UIView *existing = objc_getAssociatedObject(iv, kDFENativeIconKey);
+        if (existing && existing.superview == iv) {
             continue;
         }
 
+        UIView *sbIconView = DFECreateNativeIconView(bundleID, iv.bounds, templateIconView);
+        if (!sbIconView) continue;
+
         iv.userInteractionEnabled = YES;
+        iv.clipsToBounds = NO;
 
-        DFEIconInteractionHandler *handler = [[DFEIconInteractionHandler alloc] init];
-        handler.bundleID = bundleID;
-        handler.iconView = iv;
+        // Insert at index 0 so DockFlipBadge subviews remain on top of SBIconView
+        [iv insertSubview:sbIconView atIndex:0];
 
-        // 1. Swipe-up gesture -> AppData
-        UISwipeGestureRecognizer *swipeUp = [[UISwipeGestureRecognizer alloc] initWithTarget:handler action:@selector(handleSwipeUp:)];
-        swipeUp.direction = UISwipeGestureRecognizerDirectionUp;
-        swipeUp.cancelsTouchesInView = YES;
-        [iv addGestureRecognizer:swipeUp];
-        handler.swipeUpGesture = swipeUp;
+        // Clear DockFlip's static image so SBIconView renders cleanly without double-layering
+        iv.image = nil;
 
-        // Prevent tap from firing when user swipes up
+        // Disable DockFlip's raw tap gesture so SBIconView handles native tap launch + context menu + AppData swipe
         for (UIGestureRecognizer *gr in iv.gestureRecognizers) {
             if ([gr isKindOfClass:[UITapGestureRecognizer class]]) {
-                [gr requireGestureRecognizerToFail:swipeUp];
+                gr.enabled = NO;
             }
         }
 
-        // 2. Long-press context menu -> Quick Actions + AppData
-        UIContextMenuInteraction *menuInteraction = [[UIContextMenuInteraction alloc] initWithDelegate:handler];
-        [iv addInteraction:menuInteraction];
-        handler.contextMenuInteraction = menuInteraction;
-
-        objc_setAssociatedObject(iv, kDFEHandlerKey, handler, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(iv, kDFENativeIconKey, sbIconView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
 // ============================================================================
-// DockFlipController Hooks (Bidirectional Infinite Loop + Icon Enhancement)
+// DockFlipController Hooks (Bidirectional Infinite Loop + Native Icon Embedding)
 // ============================================================================
 
 static double (*orig_progressForDragFrom_translation)(DockFlipController *, SEL, double, double);
@@ -534,7 +291,6 @@ static double hook_progressForDragFrom_translation(DockFlipController *self, SEL
         return orig_progressForDragFrom_translation(self, _cmd, start, translation);
     }
     double raw = start - (translation / travel);
-    // Cap to +/- 1 page per drag gesture so fast drags stay predictable
     if (raw > start + 1.0) raw = start + 1.0;
     if (raw < start - 1.0) raw = start - 1.0;
     return raw;
@@ -600,11 +356,11 @@ static void hook_applyProgress(DockFlipController *self, SEL _cmd) {
         clip.hidden = (t < 0.001);
     }
 
-    // Cold-boot guard: if DockFlip built the page before our hook attached, enhance lazily on first reveal
+    // Cold-boot guard: lazily attach SBIconView if DockFlip built the page before our hook attached
     if (t > 0.01 && page.subviews.count > 0) {
         for (UIView *sub in page.subviews) {
             if ([sub isKindOfClass:[UIImageView class]] && sub.accessibilityIdentifier.length > 0) {
-                if (!objc_getAssociatedObject(sub, kDFEHandlerKey)) {
+                if (!objc_getAssociatedObject(sub, kDFENativeIconKey)) {
                     DFEEnhancePageIcons(self);
                 }
                 break;
@@ -613,19 +369,66 @@ static void hook_applyProgress(DockFlipController *self, SEL _cmd) {
     }
 }
 
-// 4. Normalize settled progress back into {0.0, 1.0} once spring finishes
+// 4. Replace tick: spring integration WITHOUT DockFlip's [-0.15, 1.15] hard clamp
 static void hook_tick(DockFlipController *self, SEL _cmd, CADisplayLink *link) {
-    orig_tick(self, _cmd, link);
+    if (!self.dock) {
+        [self stopSpring];
+        return;
+    }
 
-    if (self.link == nil) {
-        double p = self.progress;
-        if (p < -0.001 || p > 1.001) {
-            long idx = lrint(p);
-            double norm = (idx & 1) ? 1.0 : 0.0;
-            self.progress = norm;
-            self.target = norm;
-            [self applyProgress];
+    CFTimeInterval now = link.timestamp;
+    double dt = 0.0;
+    double last = self.lastTimestamp;
+    if (last > 0.0) {
+        dt = now - last;
+    } else {
+        double next = link.targetTimestamp - now;
+        if (next > 0.0) {
+            dt = next;
+        } else if (link.duration > 0.0) {
+            dt = link.duration;
+        } else {
+            dt = 1.0 / 60.0;
         }
+    }
+    self.lastTimestamp = now;
+
+    if (dt < 0.0) dt = 0.0;
+    if (dt > 0.05) dt = 0.05;
+
+    int steps = (int)ceil(dt / (1.0 / 240.0));
+    if (steps < 1) steps = 1;
+    double h = dt / (double)steps;
+
+    double p = self.progress;
+    double v = self.velocity;
+    double target = self.target;
+
+    // Exact spring constants from DockFlip.dylib
+    static const double kDamping = -23.935944027350807;
+    static const double kStiffness = -223.80055331268386;
+
+    for (int i = 0; i < steps; i++) {
+        double accel = (p - target) * kStiffness + v * kDamping;
+        v += accel * h;
+        p += v * h;
+    }
+
+    if (p < self.flightMin) self.flightMin = p;
+    if (p > self.flightMax) self.flightMax = p;
+
+    if (fabs(p - target) < 0.0005 && fabs(v) < 0.01) {
+        long idx = lrint(target);
+        double norm = (idx & 1) ? 1.0 : 0.0;
+        self.progress = norm;
+        self.target = norm;
+        self.velocity = 0.0;
+        [self stopSpring];
+        [self applyProgress];
+    } else {
+        self.progress = p;
+        self.velocity = v;
+        [self applyProgress];
     }
 }
 
@@ -653,12 +456,12 @@ static void TryHookDockFlipController(void) {
     MSHookMessageEx(cls, @selector(tick:), (IMP)hook_tick, (IMP *)&orig_tick);
     MSHookMessageEx(cls, @selector(rebuildPageWithList:), (IMP)hook_rebuildPageWithList, (IMP *)&orig_rebuildPageWithList);
 
-    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (loop + context menu + AppData)");
+    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.0 unclamped loop + native SBIconView)");
 }
 
 __attribute__((constructor))
 static void DockFlipEnhanceInit(void) {
-    os_log(DFELog(), "[DockFlipEnhance] initialized");
+    os_log(DFELog(), "[DockFlipEnhance] initialized (v0.2.0)");
     TryHookDockFlipController();
 
     if (!gHooked) {
