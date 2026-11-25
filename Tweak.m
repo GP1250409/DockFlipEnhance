@@ -54,15 +54,45 @@ static BOOL DFEIsVerticalDock(DockFlipController *ctrl) {
     return vertical;
 }
 
+static void DFESetDockSwipeGesturesEnabled(UIView *view, BOOL enabled) {
+    if (!view) return;
+    for (UIGestureRecognizer *gr in view.gestureRecognizers) {
+        if ([gr isKindOfClass:[UISwipeGestureRecognizer class]]) {
+            gr.enabled = enabled;
+        }
+    }
+    for (UIView *sub in view.subviews) {
+        DFESetDockSwipeGesturesEnabled(sub, enabled);
+    }
+}
+
+static void DFERefreshEdgeDeferralForDock(UIView *dock) {
+    if (!dock) return;
+    SEL ancSel = NSSelectorFromString(@"_viewControllerForAncestor");
+    UIViewController *vc = [dock respondsToSelector:ancSel]
+        ? ((id (*)(id, SEL))objc_msgSend)(dock, ancSel)
+        : nil;
+    if (!vc) vc = dock.window.rootViewController;
+    while (vc) {
+        if ([vc respondsToSelector:@selector(setNeedsUpdateOfScreenEdgesDeferringSystemGestures)]) {
+            [vc setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
+        }
+        vc = vc.parentViewController;
+    }
+}
+
 static void DFETunePanForOrientation(DockFlipController *ctrl, BOOL vertical) {
     UIPanGestureRecognizer *pan = ctrl.pan;
-    if (!pan) return;
-    pan.cancelsTouchesInView = YES;
-    SEL hystSel = NSSelectorFromString(@"_setHysteresis:");
-    if ([pan respondsToSelector:hystSel]) {
-        // 4pt in vertical right-edge dock so pan starts immediately before long-press menu triggers
-        ((void (*)(id, SEL, double))objc_msgSend)(pan, hystSel, vertical ? 4.0 : 10.0);
+    if (pan) {
+        pan.cancelsTouchesInView = YES;
+        SEL hystSel = NSSelectorFromString(@"_setHysteresis:");
+        if ([pan respondsToSelector:hystSel]) {
+            ((void (*)(id, SEL, double))objc_msgSend)(pan, hystSel, vertical ? 4.0 : 10.0);
+        }
     }
+    // Disable competing icon UISwipeGestureRecognizer (AppData swipe-up) strictly while vertical Dock is active
+    DFESetDockSwipeGesturesEnabled(ctrl.dock, !vertical);
+    DFERefreshEdgeDeferralForDock(ctrl.dock);
 }
 
 static UIRectEdge (*orig_hs_preferredEdges)(id, SEL);
@@ -669,7 +699,7 @@ static BOOL hook_gestureShouldBegin(DockFlipController *self, SEL _cmd, UIGestur
         CGFloat ax = fabs(t.x) > 0.5 ? fabs(t.x) : fabs(v.x);
         CGFloat ay = fabs(t.y) > 0.5 ? fabs(t.y) : fabs(v.y);
         // Allow natural diagonal thumb arc on right-edge vertical dock
-        return (ay >= ax * 0.5);
+        return (ay >= ax * 0.35);
     }
     return orig_gestureShouldBegin ? orig_gestureShouldBegin(self, _cmd, gr) : YES;
 }
@@ -897,9 +927,10 @@ static void hook_tick(DockFlipController *self, SEL _cmd, CADisplayLink *link) {
 static void hook_rebuildPageWithList(DockFlipController *self, SEL _cmd, UIView *list) {
     orig_rebuildPageWithList(self, _cmd, list);
     BOOL vertical = DFEIsVerticalDock(self);
-    DFETunePanForOrientation(self, vertical);
     DFERelayoutPageVerticallyIfNeeded(self, list);
     DFEEnhancePageIcons(self);
+    // Run after DFEEnhancePageIcons so newly created SBIconImageViews also have swipe-up disabled in vertical mode
+    DFETunePanForOrientation(self, vertical);
 }
 
 // ============================================================================
