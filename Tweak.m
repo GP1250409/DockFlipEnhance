@@ -216,6 +216,41 @@ static UIView *DFEFindTemplateDockIconView(DockFlipController *ctrl) {
 
 static const void *kDFENativeIconKey = &kDFENativeIconKey;
 static const void *kDFEIsDockFlipIconKey = &kDFEIsDockFlipIconKey;
+static const void *kDFEBundleIDKey = &kDFEBundleIDKey;
+
+static void DFEOpenApplication(NSString *bundleID) {
+    if (bundleID.length == 0) return;
+    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+    SEL defaultSel = NSSelectorFromString(@"defaultWorkspace");
+    SEL openSel = NSSelectorFromString(@"openApplicationWithBundleID:");
+    if (wsCls && [wsCls respondsToSelector:defaultSel]) {
+        id ws = ((id (*)(id, SEL))objc_msgSend)(wsCls, defaultSel);
+        if (ws && [ws respondsToSelector:openSel]) {
+            BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, openSel, bundleID);
+            if (ok) return;
+        }
+    }
+    UIApplication *app = [UIApplication sharedApplication];
+    SEL launchSel = NSSelectorFromString(@"launchApplicationWithIdentifier:suspended:");
+    if ([app respondsToSelector:launchSel]) {
+        ((void (*)(id, SEL, id, BOOL))objc_msgSend)(app, launchSel, bundleID, NO);
+    }
+}
+
+static NSString *DFEBundleIDForIconView(id iconView) {
+    if (!iconView) return nil;
+    NSString *bid = objc_getAssociatedObject(iconView, kDFEBundleIDKey);
+    if (bid.length > 0) return bid;
+    SEL iconSel = NSSelectorFromString(@"icon");
+    if ([iconView respondsToSelector:iconSel]) {
+        id icon = ((id (*)(id, SEL))objc_msgSend)(iconView, iconSel);
+        SEL bidSel = NSSelectorFromString(@"applicationBundleID");
+        if (icon && [icon respondsToSelector:bidSel]) {
+            return ((id (*)(id, SEL))objc_msgSend)(icon, bidSel);
+        }
+    }
+    return nil;
+}
 
 static void DFEDisableEditingLongPressOnIconView(UIView *iconView) {
     if (!iconView) return;
@@ -351,6 +386,7 @@ static UIView *DFECreateNativeIconView(NSString *bundleID, CGRect targetBounds, 
             }
         }
         objc_setAssociatedObject(iconView, kDFEIsDockFlipIconKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(iconView, kDFEBundleIDKey, bundleID, OBJC_ASSOCIATION_COPY_NONATOMIC);
         SEL forbidSel = NSSelectorFromString(@"startForbiddingEditingModeWithReason:");
         if ([iconView respondsToSelector:forbidSel]) {
             ((void (*)(id, SEL, id))objc_msgSend)(iconView, forbidSel, @"DockFlipEnhance");
@@ -543,6 +579,34 @@ static void hook_mgr_setEditingWithFeedback(id self, SEL _cmd, BOOL editing, id 
     }
     if (orig_mgr_setEditingWithFeedback) {
         orig_mgr_setEditingWithFeedback(self, _cmd, editing, feedback);
+    }
+}
+
+static void (*orig_mgr_iconTapped)(id, SEL, id);
+static void hook_mgr_iconTapped(id self, SEL _cmd, id iconView) {
+    if (iconView && objc_getAssociatedObject(iconView, kDFEIsDockFlipIconKey)) {
+        NSString *bid = DFEBundleIDForIconView(iconView);
+        if (bid.length > 0) {
+            DFEOpenApplication(bid);
+            return;
+        }
+    }
+    if (orig_mgr_iconTapped) {
+        orig_mgr_iconTapped(self, _cmd, iconView);
+    }
+}
+
+static void (*orig_mgr_iconTappedModifiers)(id, SEL, id, long long);
+static void hook_mgr_iconTappedModifiers(id self, SEL _cmd, id iconView, long long flags) {
+    if (iconView && objc_getAssociatedObject(iconView, kDFEIsDockFlipIconKey)) {
+        NSString *bid = DFEBundleIDForIconView(iconView);
+        if (bid.length > 0) {
+            DFEOpenApplication(bid);
+            return;
+        }
+    }
+    if (orig_mgr_iconTappedModifiers) {
+        orig_mgr_iconTappedModifiers(self, _cmd, iconView, flags);
     }
 }
 
@@ -1127,6 +1191,14 @@ static void TryHookDockFlipController(void) {
         SEL setEditFbSel = NSSelectorFromString(@"setEditing:withFeedbackBehavior:");
         if ([iconMgrCls instancesRespondToSelector:setEditFbSel]) {
             MSHookMessageEx(iconMgrCls, setEditFbSel, (IMP)hook_mgr_setEditingWithFeedback, (IMP *)&orig_mgr_setEditingWithFeedback);
+        }
+        SEL iconTappedSel = NSSelectorFromString(@"iconTapped:");
+        if ([iconMgrCls instancesRespondToSelector:iconTappedSel]) {
+            MSHookMessageEx(iconMgrCls, iconTappedSel, (IMP)hook_mgr_iconTapped, (IMP *)&orig_mgr_iconTapped);
+        }
+        SEL iconTappedModSel = NSSelectorFromString(@"iconTapped:modifierFlags:");
+        if ([iconMgrCls instancesRespondToSelector:iconTappedModSel]) {
+            MSHookMessageEx(iconMgrCls, iconTappedModSel, (IMP)hook_mgr_iconTappedModifiers, (IMP *)&orig_mgr_iconTappedModifiers);
         }
     }
 
