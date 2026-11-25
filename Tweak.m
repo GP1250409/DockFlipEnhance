@@ -496,36 +496,59 @@ static void DFERelayoutPageVerticallyIfNeeded(DockFlipController *ctrl, UIView *
     }];
 
     CGFloat iconSize = 60.0;
+    CGFloat w = page.bounds.size.width;
+    CGFloat h = page.bounds.size.height;
     CGFloat midX = CGRectGetMidX(page.bounds);
     CGFloat firstMidY = 0.0;
     CGFloat lastMidY = 0.0;
+    BOOL haveNativeRange = NO;
 
     if (nativeIcons.count > 0) {
         UIView *first = nativeIcons.firstObject;
         UIView *last = nativeIcons.lastObject;
         SEL imgFrameSel = NSSelectorFromString(@"iconImageFrame");
+
+        // Compute centers purely in untransformed iconList coordinates (immune to sublayerTransform!)
         CGRect f1 = first.frame;
         CGRect f2 = last.frame;
+        CGFloat y1 = CGRectGetMidY(f1);
+        CGFloat y2 = CGRectGetMidY(f2);
+        CGFloat x1 = CGRectGetMidX(f1);
+
         if ([first respondsToSelector:imgFrameSel]) {
             CGRect imgF = ((CGRect (*)(id, SEL))objc_msgSend)(first, imgFrameSel);
-            if (imgF.size.width > 1.0) iconSize = imgF.size.width;
-            f1 = [page convertRect:imgF fromView:first];
+            if (imgF.size.width > 1.0) {
+                iconSize = imgF.size.width;
+                x1 = f1.origin.x + CGRectGetMidX(imgF);
+                y1 = f1.origin.y + CGRectGetMidY(imgF);
+            }
         } else if (f1.size.width > 1.0) {
             iconSize = MIN(f1.size.width, f1.size.height);
-            f1 = [page convertRect:first.bounds fromView:first];
         }
         if ([last respondsToSelector:imgFrameSel]) {
             CGRect imgF = ((CGRect (*)(id, SEL))objc_msgSend)(last, imgFrameSel);
-            f2 = [page convertRect:imgF fromView:last];
-        } else {
-            f2 = [page convertRect:last.bounds fromView:last];
+            if (imgF.size.width > 1.0) {
+                y2 = f2.origin.y + CGRectGetMidY(imgF);
+            }
         }
-        midX = CGRectGetMidX(f1);
-        firstMidY = CGRectGetMidY(f1);
-        lastMidY = CGRectGetMidY(f2);
-    } else {
-        CGFloat h = page.bounds.size.height;
-        CGFloat pad = iconSize * 0.65;
+
+        CGRect platterInList = ctrl.platterInList;
+        CGFloat px = x1 - platterInList.origin.x;
+        CGFloat py1 = y1 - platterInList.origin.y;
+        CGFloat py2 = y2 - platterInList.origin.y;
+
+        if (px > 0.0 && px < w) {
+            midX = px;
+        }
+        if (py1 > 0.0 && py2 > py1 + 10.0 && py2 < h) {
+            firstMidY = py1;
+            lastMidY = py2;
+            haveNativeRange = YES;
+        }
+    }
+
+    if (!haveNativeRange) {
+        CGFloat pad = MIN(h * 0.25, iconSize * 0.75);
         firstMidY = pad;
         lastMidY = MAX(pad, h - pad);
     }
