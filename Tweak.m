@@ -43,11 +43,35 @@
 - (void)handlePan:(UIPanGestureRecognizer *)pan;
 @end
 
+static BOOL gDFEVerticalDockActive = NO;
+
 static BOOL DFEIsVerticalDock(DockFlipController *ctrl) {
     UIView *ref = ctrl.page ?: ctrl.dock;
     if (!ref) return NO;
     CGRect b = ref.bounds;
-    return (b.size.height > b.size.width + 20.0);
+    BOOL vertical = (b.size.height > b.size.width + 20.0);
+    gDFEVerticalDockActive = vertical;
+    return vertical;
+}
+
+static void DFETunePanForOrientation(DockFlipController *ctrl, BOOL vertical) {
+    UIPanGestureRecognizer *pan = ctrl.pan;
+    if (!pan) return;
+    pan.cancelsTouchesInView = YES;
+    SEL hystSel = NSSelectorFromString(@"_setHysteresis:");
+    if ([pan respondsToSelector:hystSel]) {
+        // 4pt in vertical right-edge dock so pan starts immediately before long-press menu triggers
+        ((void (*)(id, SEL, double))objc_msgSend)(pan, hystSel, vertical ? 4.0 : 10.0);
+    }
+}
+
+static UIRectEdge (*orig_hs_preferredEdges)(id, SEL);
+static UIRectEdge hook_hs_preferredEdges(id self, SEL _cmd) {
+    UIRectEdge orig = orig_hs_preferredEdges ? orig_hs_preferredEdges(self, _cmd) : UIRectEdgeNone;
+    if (gDFEVerticalDockActive) {
+        return orig | UIRectEdgeRight;
+    }
+    return orig;
 }
 
 // ============================================================================
@@ -615,6 +639,15 @@ static void   (*orig_tick)(DockFlipController *, SEL, CADisplayLink *);
 static void   (*orig_rebuildPageWithList)(DockFlipController *, SEL, UIView *);
 static BOOL   (*orig_gestureShouldBegin)(DockFlipController *, SEL, UIGestureRecognizer *);
 static BOOL   (*orig_shouldBeRequiredToFail)(DockFlipController *, SEL, UIGestureRecognizer *, UIGestureRecognizer *);
+static BOOL   (*orig_shouldRequireFailure)(DockFlipController *, SEL, UIGestureRecognizer *, UIGestureRecognizer *);
+
+static BOOL hook_shouldRequireFailure(DockFlipController *self, SEL _cmd, UIGestureRecognizer *gr, UIGestureRecognizer *other) {
+    if (gr == self.pan && DFEIsVerticalDock(self)) {
+        return NO;
+    }
+    return orig_shouldRequireFailure ? orig_shouldRequireFailure(self, _cmd, gr, other) : NO;
+}
+
 static void   (*orig_handlePan)(DockFlipController *, SEL, UIPanGestureRecognizer *);
 
 static double hook_travel(DockFlipController *self, SEL _cmd) {
@@ -863,6 +896,8 @@ static void hook_tick(DockFlipController *self, SEL _cmd, CADisplayLink *link) {
 // 5. Enhance extra-page icons whenever DockFlip rebuilds the page
 static void hook_rebuildPageWithList(DockFlipController *self, SEL _cmd, UIView *list) {
     orig_rebuildPageWithList(self, _cmd, list);
+    BOOL vertical = DFEIsVerticalDock(self);
+    DFETunePanForOrientation(self, vertical);
     DFERelayoutPageVerticallyIfNeeded(self, list);
     DFEEnhancePageIcons(self);
 }
@@ -882,6 +917,12 @@ static void TryHookDockFlipController(void) {
     MSHookMessageEx(cls, @selector(travel), (IMP)hook_travel, (IMP *)&orig_travel);
     MSHookMessageEx(cls, @selector(gestureRecognizerShouldBegin:), (IMP)hook_gestureShouldBegin, (IMP *)&orig_gestureShouldBegin);
     MSHookMessageEx(cls, @selector(gestureRecognizer:shouldBeRequiredToFailByGestureRecognizer:), (IMP)hook_shouldBeRequiredToFail, (IMP *)&orig_shouldBeRequiredToFail);
+    SEL reqFailSel = @selector(gestureRecognizer:shouldRequireFailureOfGestureRecognizer:);
+    if ([cls instancesRespondToSelector:reqFailSel]) {
+        MSHookMessageEx(cls, reqFailSel, (IMP)hook_shouldRequireFailure, (IMP *)&orig_shouldRequireFailure);
+    } else {
+        class_addMethod(cls, reqFailSel, (IMP)hook_shouldRequireFailure, "B@:@@");
+    }
     MSHookMessageEx(cls, @selector(handlePan:), (IMP)hook_handlePan, (IMP *)&orig_handlePan);
     MSHookMessageEx(cls, @selector(progressForDragFrom:translation:), (IMP)hook_progressForDragFrom_translation, (IMP *)&orig_progressForDragFrom_translation);
     MSHookMessageEx(cls, @selector(targetForProgress:velocity:), (IMP)hook_targetForProgress_velocity, (IMP *)&orig_targetForProgress_velocity);
@@ -953,7 +994,13 @@ static void TryHookDockFlipController(void) {
         }
     }
 
-    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.3 unclamped loop + native SBIconView + full setEditing guard)");
+    // Defer right-edge system gesture gate on Home Screen when Plus vertical Dock is active
+    Class hsVCCls = objc_getClass("SBHomeScreenViewController");
+    if (hsVCCls) {
+        MSHookMessageEx(hsVCCls, @selector(preferredScreenEdgesDeferringSystemGestures), (IMP)hook_hs_preferredEdges, (IMP *)&orig_hs_preferredEdges);
+    }
+
+    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.8)");
 }
 
 __attribute__((constructor))
