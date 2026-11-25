@@ -70,13 +70,15 @@ jobs:
           cat > control << 'EOF'
           Package: cc.gonepaul.dockflipenhance.rootless
           Name: DockFlip 增强补丁 (Rootless)
-          Version: 0.2.11
+          Version: 0.3.0
           Architecture: iphoneos-arm64
-          Description: Enhances DockFlip with smooth bidirectional infinite dock paging and native SBIconView long-press Quick Actions / AppData / Choicy support on extra page icons (Dopamine Rootless iOS 16 arm64).
+          Description: All-in-one DockFlip enhancement for Dopamine Rootless iOS 16 arm64: native badge sync, bidirectional infinite dock paging, Plus landscape vertical Dock support, native SBIconView Quick Actions menu, and AppData / Choicy support.
           Maintainer: Paul
           Author: Paul
           Section: Tweaks
           Depends: ellekit | mobilesubstrate, wiki.qaq.dockflip
+          Conflicts: cc.gonepaul.dockflipbadge.rootless
+          Replaces: cc.gonepaul.dockflipbadge.rootless
           EOF
 
       - name: Build Rootless arm64 deb

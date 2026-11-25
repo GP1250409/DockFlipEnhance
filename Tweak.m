@@ -298,7 +298,7 @@ static UIView *DFECreateNativeIconView(NSString *bundleID, CGRect targetBounds, 
             ((void (*)(id, SEL, id))objc_msgSend)(iconView, setLocSel, loc);
         }
 
-        // 3. Configure dock appearance (no label; no duplicate badge so DockFlipBadge stays authoritative)
+        // 3. Configure dock appearance (no label; enable native badge accessory view)
         SEL setAllowsLabelSel = NSSelectorFromString(@"setAllowsLabelArea:");
         if ([iconView respondsToSelector:setAllowsLabelSel]) {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(iconView, setAllowsLabelSel, NO);
@@ -309,17 +309,24 @@ static UIView *DFECreateNativeIconView(NSString *bundleID, CGRect targetBounds, 
         }
         SEL setAllowsAccSel = NSSelectorFromString(@"setAllowsAccessoryView:");
         if ([iconView respondsToSelector:setAllowsAccSel]) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(iconView, setAllowsAccSel, NO);
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(iconView, setAllowsAccSel, YES);
         }
         SEL setAllowsCloseSel = NSSelectorFromString(@"setAllowsCloseBox:");
         if ([iconView respondsToSelector:setAllowsCloseSel]) {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(iconView, setAllowsCloseSel, NO);
         }
 
-        // 4. Bind the real SBApplicationIcon
+        // 4. Bind the real SBApplicationIcon & refresh badge accessory
         SEL setIconSel = NSSelectorFromString(@"setIcon:");
         if ([iconView respondsToSelector:setIconSel]) {
             ((void (*)(id, SEL, id))objc_msgSend)(iconView, setIconSel, sbIcon);
+        }
+        SEL updateAccSel = NSSelectorFromString(@"_updateAccessoryViewWithPreviousSettings:");
+        SEL updateAccAnimSel = NSSelectorFromString(@"updateAccessoryViewAnimated:");
+        if ([iconView respondsToSelector:updateAccAnimSel]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(iconView, updateAccAnimSel, NO);
+        } else if ([iconView respondsToSelector:updateAccSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(iconView, updateAccSel, nil);
         }
 
         // 5. Align iconView frame so its iconImageFrame sits 1:1 over DockFlip's icon rect
@@ -644,6 +651,40 @@ static void DFERelayoutPageVerticallyIfNeeded(DockFlipController *ctrl, UIView *
     }
 }
 
+static NSHashTable<UIView *> *gDFETrackedIconViews = nil;
+
+static void DFETrackIconView(UIView *iconView) {
+    if (!iconView) return;
+    if (!gDFETrackedIconViews) {
+        gDFETrackedIconViews = [NSHashTable weakObjectsHashTable];
+    }
+    [gDFETrackedIconViews addObject:iconView];
+}
+
+static void (*orig_noteBadgeDidChange)(id, SEL);
+static void hook_noteBadgeDidChange(id self, SEL _cmd) {
+    if (orig_noteBadgeDidChange) {
+        orig_noteBadgeDidChange(self, _cmd);
+    }
+    if (!gDFETrackedIconViews) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SEL iconSel = NSSelectorFromString(@"icon");
+        SEL updateAccAnimSel = NSSelectorFromString(@"updateAccessoryViewAnimated:");
+        SEL updateAccSel = NSSelectorFromString(@"_updateAccessoryViewWithPreviousSettings:");
+        for (UIView *iv in [gDFETrackedIconViews allObjects]) {
+            if (!iv.window) continue;
+            id boundIcon = [iv respondsToSelector:iconSel] ? ((id (*)(id, SEL))objc_msgSend)(iv, iconSel) : nil;
+            if (boundIcon == self) {
+                if ([iv respondsToSelector:updateAccAnimSel]) {
+                    ((void (*)(id, SEL, BOOL))objc_msgSend)(iv, updateAccAnimSel, YES);
+                } else if ([iv respondsToSelector:updateAccSel]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(iv, updateAccSel, nil);
+                }
+            }
+        }
+    });
+}
+
 static void DFEEnhancePageIcons(DockFlipController *ctrl) {
     UIView *page = ctrl.page;
     if (!page) return;
@@ -681,6 +722,7 @@ static void DFEEnhancePageIcons(DockFlipController *ctrl) {
         }
 
         objc_setAssociatedObject(iv, kDFENativeIconKey, sbIconView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        DFETrackIconView(sbIconView);
     }
 }
 
@@ -1094,7 +1136,16 @@ static void TryHookDockFlipController(void) {
         MSHookMessageEx(hsVCCls, @selector(preferredScreenEdgesDeferringSystemGestures), (IMP)hook_hs_preferredEdges, (IMP *)&orig_hs_preferredEdges);
     }
 
-    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.2.8)");
+    // Live badge sync on SBIcon -noteBadgeDidChange
+    Class sbIconCls = objc_getClass("SBIcon");
+    if (sbIconCls) {
+        SEL badgeSel = NSSelectorFromString(@"noteBadgeDidChange");
+        if ([sbIconCls instancesRespondToSelector:badgeSel]) {
+            MSHookMessageEx(sbIconCls, badgeSel, (IMP)hook_noteBadgeDidChange, (IMP *)&orig_noteBadgeDidChange);
+        }
+    }
+
+    os_log(DFELog(), "[DockFlipEnhance] hooked DockFlipController (v0.3.0 with native badge sync)");
 }
 
 __attribute__((constructor))
