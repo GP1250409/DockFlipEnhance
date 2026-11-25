@@ -533,22 +533,24 @@ static void DFERelayoutPageVerticallyIfNeeded(DockFlipController *ctrl, UIView *
         }
 
         CGRect platterInList = ctrl.platterInList;
-        CGFloat px = x1 - platterInList.origin.x;
         CGFloat py1 = y1 - platterInList.origin.y;
         CGFloat py2 = y2 - platterInList.origin.y;
-
-        if (px > 0.0 && px < w) {
-            midX = px;
-        }
-        if (py1 > 0.0 && py2 > py1 + 10.0 && py2 < h) {
-            firstMidY = py1;
-            lastMidY = py2;
+        CGFloat nativeSpan = py2 - py1;
+        CGFloat maxSpan = MAX(0.0, h - iconSize - 36.0);
+        if (nativeSpan > 10.0) {
+            CGFloat span = MIN(nativeSpan, maxSpan);
+            CGFloat centerY = h * 0.5;
+            firstMidY = centerY - span * 0.5;
+            lastMidY = centerY + span * 0.5;
             haveNativeRange = YES;
         }
     }
 
+    // Keep icons horizontally centered inside vertical dock platter
+    midX = w * 0.5;
+
     if (!haveNativeRange) {
-        CGFloat pad = MIN(h * 0.25, iconSize * 0.75);
+        CGFloat pad = MAX(iconSize * 0.5 + 18.0, h * 0.14);
         firstMidY = pad;
         lastMidY = MAX(pad, h - pad);
     }
@@ -635,8 +637,8 @@ static BOOL hook_gestureShouldBegin(DockFlipController *self, SEL _cmd, UIGestur
         CGPoint v = [self.pan velocityInView:dock];
         CGFloat ax = fabs(t.x) > 0.5 ? fabs(t.x) : fabs(v.x);
         CGFloat ay = fabs(t.y) > 0.5 ? fabs(t.y) : fabs(v.y);
-        // Allow slight natural diagonal thumb arc on right-edge vertical dock
-        return (ay >= ax * 0.65);
+        // Allow natural diagonal thumb arc on right-edge vertical dock
+        return (ay >= ax * 0.5);
     }
     return orig_gestureShouldBegin ? orig_gestureShouldBegin(self, _cmd, gr) : YES;
 }
@@ -703,6 +705,13 @@ static double hook_progressForDragFrom_translation(DockFlipController *self, SEL
 // 2. Pick nearest integer page in [start-1, start+1] instead of hardcoding {0, 1}
 static double hook_targetForProgress_velocity(DockFlipController *self, SEL _cmd, double progress, double velocity) {
     double start = round([self panStartProgress]);
+    if (DFEIsVerticalDock(self)) {
+        // Vertical right-edge dock has shorter thumb travel; use a more responsive flip threshold
+        double projected = progress + velocity * 0.32;
+        if (projected >= start + 0.28) return start + 1.0;
+        if (projected <= start - 0.28) return start - 1.0;
+        return start;
+    }
     double projected = progress + velocity * 0.18;
     double target = round(projected);
     if (target > start + 1.0) target = start + 1.0;
