@@ -1,4 +1,4 @@
-name: Build DockFlipEnhance (RootHide arm64e)
+name: Build DockFlipEnhance (RootHide & Rootless)
 
 on:
   push:
@@ -37,8 +37,59 @@ jobs:
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
           ls -la packages/
 
-      - name: Upload deb artifact
+      - name: Upload RootHide deb artifact
         uses: actions/upload-artifact@v4
         with:
           name: DockFlipEnhance-roothide-arm64e
+          path: packages/*.deb
+
+  build-rootless:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Theos (Rootless)
+        run: |
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Install iOS SDK
+        run: |
+          mkdir -p ~/theos/sdks
+          curl -fsSL https://github.com/theos/sdks/archive/refs/heads/master.tar.gz | tar -xz -C /tmp
+          cp -R /tmp/sdks-master/iPhoneOS16.5.sdk ~/theos/sdks/
+
+      - name: Install ldid & dpkg
+        run: |
+          brew install ldid dpkg
+
+      - name: Prepare Rootless control metadata
+        run: |
+          cat > control << 'EOF'
+          Package: cc.gonepaul.dockflipenhance.rootless
+          Name: DockFlip 增强补丁 (Rootless)
+          Version: 0.2.3
+          Architecture: iphoneos-arm64
+          Description: Enhances DockFlip with smooth bidirectional infinite dock paging and native SBIconView long-press Quick Actions / AppData / Choicy support on extra page icons (Dopamine Rootless iOS 16 arm64).
+          Maintainer: Paul
+          Author: Paul
+          Section: Tweaks
+          Depends: ellekit | mobilesubstrate, wiki.qaq.dockflip
+          EOF
+
+      - name: Build Rootless arm64 deb
+        env:
+          THEOS: ${{ env.THEOS }}
+          THEOS_PACKAGE_SCHEME: rootless
+        run: |
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          ls -la packages/
+
+      - name: Upload Rootless deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DockFlipEnhance-rootless-arm64
           path: packages/*.deb
