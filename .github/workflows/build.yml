@@ -1,0 +1,44 @@
+name: Build DockFlipEnhance (RootHide arm64e)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-roothide:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Theos (RootHide)
+        run: |
+          git clone --recursive https://github.com/roothide/theos.git ~/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Install iOS SDK
+        run: |
+          mkdir -p ~/theos/sdks
+          curl -fsSL https://github.com/theos/sdks/archive/refs/heads/master.tar.gz | tar -xz -C /tmp
+          cp -R /tmp/sdks-master/iPhoneOS16.5.sdk ~/theos/sdks/
+
+      - name: Install ldid & dpkg
+        run: |
+          brew install ldid dpkg
+
+      - name: Build RootHide arm64e deb
+        env:
+          THEOS: ${{ env.THEOS }}
+          THEOS_PACKAGE_SCHEME: roothide
+        run: |
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+          ls -la packages/
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DockFlipEnhance-roothide-arm64e
+          path: packages/*.deb
