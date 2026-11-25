@@ -614,6 +614,7 @@ static void   (*orig_applyProgress)(DockFlipController *, SEL);
 static void   (*orig_tick)(DockFlipController *, SEL, CADisplayLink *);
 static void   (*orig_rebuildPageWithList)(DockFlipController *, SEL, UIView *);
 static BOOL   (*orig_gestureShouldBegin)(DockFlipController *, SEL, UIGestureRecognizer *);
+static BOOL   (*orig_shouldBeRequiredToFail)(DockFlipController *, SEL, UIGestureRecognizer *, UIGestureRecognizer *);
 static void   (*orig_handlePan)(DockFlipController *, SEL, UIPanGestureRecognizer *);
 
 static double hook_travel(DockFlipController *self, SEL _cmd) {
@@ -634,9 +635,23 @@ static BOOL hook_gestureShouldBegin(DockFlipController *self, SEL _cmd, UIGestur
         CGPoint v = [self.pan velocityInView:dock];
         CGFloat ax = fabs(t.x) > 0.5 ? fabs(t.x) : fabs(v.x);
         CGFloat ay = fabs(t.y) > 0.5 ? fabs(t.y) : fabs(v.y);
-        return (ay >= ax);
+        // Allow slight natural diagonal thumb arc on right-edge vertical dock
+        return (ay >= ax * 0.65);
     }
     return orig_gestureShouldBegin ? orig_gestureShouldBegin(self, _cmd, gr) : YES;
+}
+
+static BOOL hook_shouldBeRequiredToFail(DockFlipController *self, SEL _cmd, UIGestureRecognizer *gr, UIGestureRecognizer *other) {
+    if (gr == self.pan && DFEIsVerticalDock(self) && other) {
+        if ([other isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
+            return NO;
+        }
+        if ([other isKindOfClass:[UIPanGestureRecognizer class]] ||
+            [other isKindOfClass:[UISwipeGestureRecognizer class]]) {
+            return YES;
+        }
+    }
+    return orig_shouldBeRequiredToFail ? orig_shouldBeRequiredToFail(self, _cmd, gr, other) : NO;
 }
 
 static void hook_handlePan(DockFlipController *self, SEL _cmd, UIPanGestureRecognizer *pan) {
@@ -736,12 +751,14 @@ static void hook_applyProgress(DockFlipController *self, SEL _cmd) {
     [CATransaction setDisableActions:YES];
     if (vertical) {
         iconList.layer.sublayerTransform = CATransform3DMakeTranslation(0.0, listShift, 0.0);
-        if (self.listMask) {
+        if (fabs(listShift) > 0.5 && self.listMask) {
             self.listMask.frame = CGRectOffset(self.platterInList, 0.0, -listShift);
             self.listMask.cornerRadius = self.platterRadius;
             if (iconList.layer.mask != self.listMask) {
                 iconList.layer.mask = self.listMask;
             }
+        } else if (iconList.layer.mask == self.listMask) {
+            iconList.layer.mask = nil;
         }
     } else {
         iconList.layer.sublayerTransform = CATransform3DMakeTranslation(listShift, 0.0, 0.0);
@@ -857,6 +874,7 @@ static void TryHookDockFlipController(void) {
     gHooked = YES;
     MSHookMessageEx(cls, @selector(travel), (IMP)hook_travel, (IMP *)&orig_travel);
     MSHookMessageEx(cls, @selector(gestureRecognizerShouldBegin:), (IMP)hook_gestureShouldBegin, (IMP *)&orig_gestureShouldBegin);
+    MSHookMessageEx(cls, @selector(gestureRecognizer:shouldBeRequiredToFailByGestureRecognizer:), (IMP)hook_shouldBeRequiredToFail, (IMP *)&orig_shouldBeRequiredToFail);
     MSHookMessageEx(cls, @selector(handlePan:), (IMP)hook_handlePan, (IMP *)&orig_handlePan);
     MSHookMessageEx(cls, @selector(progressForDragFrom:translation:), (IMP)hook_progressForDragFrom_translation, (IMP *)&orig_progressForDragFrom_translation);
     MSHookMessageEx(cls, @selector(targetForProgress:velocity:), (IMP)hook_targetForProgress_velocity, (IMP *)&orig_targetForProgress_velocity);
