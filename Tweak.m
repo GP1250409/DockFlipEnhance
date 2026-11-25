@@ -218,6 +218,91 @@ static const void *kDFENativeIconKey = &kDFENativeIconKey;
 static const void *kDFEIsDockFlipIconKey = &kDFEIsDockFlipIconKey;
 static const void *kDFEBundleIDKey = &kDFEBundleIDKey;
 
+static NSHashTable<UIView *> *gDFETrackedIconViews = nil;
+static __weak UIView *gDFELastLaunchedIconView = nil;
+static CFAbsoluteTime gDFELastLaunchTime = 0.0;
+
+static BOOL DFEIsDockFlipIconViewCurrentlyVisible(UIView *iv) {
+    if (!iv || !iv.window || iv.isHidden || iv.alpha < 0.5) return NO;
+    UIView *v = iv.superview;
+    for (int i = 0; i < 4 && v; i++) {
+        if (v.isHidden || v.alpha < 0.5) return NO;
+        v = v.superview;
+    }
+    return YES;
+}
+
+static NSString *DFEIconBundleID(id icon) {
+    if (!icon) return nil;
+    SEL bidSel = NSSelectorFromString(@"applicationBundleID");
+    if ([icon respondsToSelector:bidSel]) {
+        id bid = ((id (*)(id, SEL))objc_msgSend)(icon, bidSel);
+        if ([bid isKindOfClass:[NSString class]]) return (NSString *)bid;
+    }
+    SEL leafSel = NSSelectorFromString(@"leafIdentifier");
+    if ([icon respondsToSelector:leafSel]) {
+        id bid = ((id (*)(id, SEL))objc_msgSend)(icon, leafSel);
+        if ([bid isKindOfClass:[NSString class]]) return (NSString *)bid;
+    }
+    return nil;
+}
+
+static BOOL DFEIconViewMatchesIcon(UIView *iconView, id icon) {
+    if (!iconView || !icon) return NO;
+    SEL iconSel = NSSelectorFromString(@"icon");
+    id boundIcon = [iconView respondsToSelector:iconSel] ? ((id (*)(id, SEL))objc_msgSend)(iconView, iconSel) : nil;
+    if (boundIcon == icon) return YES;
+    NSString *targetBid = DFEIconBundleID(icon);
+    if (targetBid.length == 0) return NO;
+    NSString *viewBid = objc_getAssociatedObject(iconView, kDFEBundleIDKey);
+    if (viewBid.length == 0 && boundIcon) {
+        viewBid = DFEIconBundleID(boundIcon);
+    }
+    return (viewBid.length > 0 && [viewBid isEqualToString:targetBid]);
+}
+
+static NSString *DFEIconViewLocation(UIView *iconView) {
+    if (!iconView) return @"SBIconLocationDock";
+    SEL locSel = NSSelectorFromString(@"location");
+    if ([iconView respondsToSelector:locSel]) {
+        id loc = ((id (*)(id, SEL))objc_msgSend)(iconView, locSel);
+        if ([loc isKindOfClass:[NSString class]] && ((NSString *)loc).length > 0) {
+            return (NSString *)loc;
+        }
+    }
+    return @"SBIconLocationDock";
+}
+
+static BOOL DFELocationMatchesIconView(id location, UIView *iconView) {
+    if (!location) return YES;
+    if (![location isKindOfClass:[NSString class]]) return NO;
+    NSString *loc = (NSString *)location;
+    return [loc isEqualToString:@"SBIconLocationDock"] || [loc isEqualToString:DFEIconViewLocation(iconView)];
+}
+
+static BOOL DFELocationsContainsDock(id locations, UIView *iconView) {
+    if (!locations) return YES;
+    if (![locations respondsToSelector:@selector(containsObject:)]) return NO;
+    if ([locations containsObject:@"SBIconLocationDock"]) return YES;
+    NSString *ivLoc = DFEIconViewLocation(iconView);
+    return (ivLoc.length > 0 && [locations containsObject:ivLoc]);
+}
+
+static UIView *DFEVisibleDockFlipIconViewForIcon(id icon) {
+    if (!icon) return nil;
+    UIView *last = gDFELastLaunchedIconView;
+    if (last && DFEIsDockFlipIconViewCurrentlyVisible(last) && DFEIconViewMatchesIcon(last, icon)) {
+        return last;
+    }
+    if (!gDFETrackedIconViews) return nil;
+    for (UIView *iv in [gDFETrackedIconViews allObjects]) {
+        if (DFEIsDockFlipIconViewCurrentlyVisible(iv) && DFEIconViewMatchesIcon(iv, icon)) {
+            return iv;
+        }
+    }
+    return nil;
+}
+
 static void DFEOpenApplication(NSString *bundleID) {
     if (bundleID.length == 0) return;
     // Prefer in-process SpringBoard launch (0ms instant, no Home Screen page jump, no main-thread XPC deadlock)
@@ -590,11 +675,19 @@ static void hook_mgr_setEditingWithFeedback(id self, SEL _cmd, BOOL editing, id 
 static void (*orig_mgr_iconTapped)(id, SEL, id);
 static void hook_mgr_iconTapped(id self, SEL _cmd, id iconView) {
     if (iconView && objc_getAssociatedObject(iconView, kDFEIsDockFlipIconKey)) {
+        gDFELastLaunchedIconView = iconView;
+        gDFELastLaunchTime = CFAbsoluteTimeGetCurrent();
+        if (orig_mgr_iconTapped) {
+            orig_mgr_iconTapped(self, _cmd, iconView);
+            return;
+        }
         NSString *bid = DFEBundleIDForIconView(iconView);
         if (bid.length > 0) {
             DFEOpenApplication(bid);
             return;
         }
+    } else {
+        gDFELastLaunchedIconView = nil;
     }
     if (orig_mgr_iconTapped) {
         orig_mgr_iconTapped(self, _cmd, iconView);
@@ -604,16 +697,128 @@ static void hook_mgr_iconTapped(id self, SEL _cmd, id iconView) {
 static void (*orig_mgr_iconTappedModifiers)(id, SEL, id, long long);
 static void hook_mgr_iconTappedModifiers(id self, SEL _cmd, id iconView, long long flags) {
     if (iconView && objc_getAssociatedObject(iconView, kDFEIsDockFlipIconKey)) {
+        gDFELastLaunchedIconView = iconView;
+        gDFELastLaunchTime = CFAbsoluteTimeGetCurrent();
+        if (orig_mgr_iconTappedModifiers) {
+            orig_mgr_iconTappedModifiers(self, _cmd, iconView, flags);
+            return;
+        }
         NSString *bid = DFEBundleIDForIconView(iconView);
         if (bid.length > 0) {
             DFEOpenApplication(bid);
             return;
         }
+    } else {
+        gDFELastLaunchedIconView = nil;
     }
     if (orig_mgr_iconTappedModifiers) {
         orig_mgr_iconTappedModifiers(self, _cmd, iconView, flags);
     }
 }
+
+static BOOL (*orig_mgr_scrollToIconList)(id, SEL, id, BOOL);
+static BOOL hook_mgr_scrollToIconList(id self, SEL _cmd, id icon, BOOL animate) {
+    UIView *last = gDFELastLaunchedIconView;
+    if (last && (CFAbsoluteTimeGetCurrent() - gDFELastLaunchTime) < 1.5 &&
+        DFEIsDockFlipIconViewCurrentlyVisible(last) && DFEIconViewMatchesIcon(last, icon)) {
+        return YES;
+    }
+    return orig_mgr_scrollToIconList ? orig_mgr_scrollToIconList(self, _cmd, icon, animate) : NO;
+}
+
+#define DFE_DEFINE_QUERY_HOOKS(P) \
+static id (*orig_##P##_firstIconView)(id, SEL, id); \
+static id hook_##P##_firstIconView(id self, SEL _cmd, id icon) { \
+    UIView *last = gDFELastLaunchedIconView; \
+    if (last && DFEIsDockFlipIconViewCurrentlyVisible(last) && DFEIconViewMatchesIcon(last, icon)) { \
+        return last; \
+    } \
+    id orig = orig_##P##_firstIconView ? orig_##P##_firstIconView(self, _cmd, icon) : nil; \
+    if (orig) return orig; \
+    return DFEVisibleDockFlipIconViewForIcon(icon); \
+} \
+static id (*orig_##P##_firstIconViewInLocs)(id, SEL, id, id); \
+static id hook_##P##_firstIconViewInLocs(id self, SEL _cmd, id icon, id locations) { \
+    UIView *last = gDFELastLaunchedIconView; \
+    if (last && DFEIsDockFlipIconViewCurrentlyVisible(last) && DFEIconViewMatchesIcon(last, icon) && DFELocationsContainsDock(locations, last)) { \
+        return last; \
+    } \
+    id orig = orig_##P##_firstIconViewInLocs ? orig_##P##_firstIconViewInLocs(self, _cmd, icon, locations) : nil; \
+    if (orig) return orig; \
+    UIView *iv = DFEVisibleDockFlipIconViewForIcon(icon); \
+    if (iv && DFELocationsContainsDock(locations, iv)) return iv; \
+    return nil; \
+} \
+static id (*orig_##P##_firstIconViewExclLocs)(id, SEL, id, id); \
+static id hook_##P##_firstIconViewExclLocs(id self, SEL _cmd, id icon, id locations) { \
+    UIView *last = gDFELastLaunchedIconView; \
+    if (last && DFEIsDockFlipIconViewCurrentlyVisible(last) && DFEIconViewMatchesIcon(last, icon) && (!locations || !DFELocationsContainsDock(locations, last))) { \
+        return last; \
+    } \
+    id orig = orig_##P##_firstIconViewExclLocs ? orig_##P##_firstIconViewExclLocs(self, _cmd, icon, locations) : nil; \
+    if (orig) return orig; \
+    UIView *iv = DFEVisibleDockFlipIconViewForIcon(icon); \
+    if (iv && (!locations || !DFELocationsContainsDock(locations, iv))) return iv; \
+    return nil; \
+} \
+static id (*orig_##P##_iconViewForLoc)(id, SEL, id, id); \
+static id hook_##P##_iconViewForLoc(id self, SEL _cmd, id icon, id location) { \
+    UIView *iv = DFEVisibleDockFlipIconViewForIcon(icon); \
+    if (iv && DFELocationMatchesIconView(location, iv)) return iv; \
+    return orig_##P##_iconViewForLoc ? orig_##P##_iconViewForLoc(self, _cmd, icon, location) : nil; \
+} \
+static BOOL (*orig_##P##_isDispIcon)(id, SEL, id); \
+static BOOL hook_##P##_isDispIcon(id self, SEL _cmd, id icon) { \
+    if (DFEVisibleDockFlipIconViewForIcon(icon) != nil) return YES; \
+    return orig_##P##_isDispIcon ? orig_##P##_isDispIcon(self, _cmd, icon) : NO; \
+} \
+static BOOL (*orig_##P##_isDispIconInLoc)(id, SEL, id, id); \
+static BOOL hook_##P##_isDispIconInLoc(id self, SEL _cmd, id icon, id location) { \
+    UIView *iv = DFEVisibleDockFlipIconViewForIcon(icon); \
+    if (iv && DFELocationMatchesIconView(location, iv)) return YES; \
+    return orig_##P##_isDispIconInLoc ? orig_##P##_isDispIconInLoc(self, _cmd, icon, location) : NO; \
+} \
+static BOOL (*orig_##P##_isDispIconInLocs)(id, SEL, id, id); \
+static BOOL hook_##P##_isDispIconInLocs(id self, SEL _cmd, id icon, id locations) { \
+    UIView *iv = DFEVisibleDockFlipIconViewForIcon(icon); \
+    if (iv && DFELocationsContainsDock(locations, iv)) return YES; \
+    return orig_##P##_isDispIconInLocs ? orig_##P##_isDispIconInLocs(self, _cmd, icon, locations) : NO; \
+} \
+static BOOL (*orig_##P##_isDispIconView)(id, SEL, id); \
+static BOOL hook_##P##_isDispIconView(id self, SEL _cmd, id iconView) { \
+    if (iconView && objc_getAssociatedObject(iconView, kDFEIsDockFlipIconKey) && DFEIsDockFlipIconViewCurrentlyVisible(iconView)) return YES; \
+    return orig_##P##_isDispIconView ? orig_##P##_isDispIconView(self, _cmd, iconView) : NO; \
+} \
+static BOOL (*orig_##P##_isDispIconViewInLoc)(id, SEL, id, id); \
+static BOOL hook_##P##_isDispIconViewInLoc(id self, SEL _cmd, id iconView, id location) { \
+    if (iconView && objc_getAssociatedObject(iconView, kDFEIsDockFlipIconKey) && DFEIsDockFlipIconViewCurrentlyVisible(iconView) && DFELocationMatchesIconView(location, iconView)) return YES; \
+    return orig_##P##_isDispIconViewInLoc ? orig_##P##_isDispIconViewInLoc(self, _cmd, iconView, location) : NO; \
+} \
+static void DFEInstallQueryHooks_##P(Class cls) { \
+    if (!cls) return; \
+    SEL s1 = NSSelectorFromString(@"firstIconViewForIcon:"); \
+    if ([cls instancesRespondToSelector:s1]) MSHookMessageEx(cls, s1, (IMP)hook_##P##_firstIconView, (IMP *)&orig_##P##_firstIconView); \
+    SEL s2 = NSSelectorFromString(@"firstIconViewForIcon:inLocations:"); \
+    if ([cls instancesRespondToSelector:s2]) MSHookMessageEx(cls, s2, (IMP)hook_##P##_firstIconViewInLocs, (IMP *)&orig_##P##_firstIconViewInLocs); \
+    SEL s3 = NSSelectorFromString(@"firstIconViewForIcon:excludingLocations:"); \
+    if ([cls instancesRespondToSelector:s3]) MSHookMessageEx(cls, s3, (IMP)hook_##P##_firstIconViewExclLocs, (IMP *)&orig_##P##_firstIconViewExclLocs); \
+    SEL s4 = NSSelectorFromString(@"iconViewForIcon:location:"); \
+    if ([cls instancesRespondToSelector:s4]) MSHookMessageEx(cls, s4, (IMP)hook_##P##_iconViewForLoc, (IMP *)&orig_##P##_iconViewForLoc); \
+    SEL s5 = NSSelectorFromString(@"isDisplayingIcon:"); \
+    if ([cls instancesRespondToSelector:s5]) MSHookMessageEx(cls, s5, (IMP)hook_##P##_isDispIcon, (IMP *)&orig_##P##_isDispIcon); \
+    SEL s6 = NSSelectorFromString(@"isDisplayingIcon:inLocation:"); \
+    if ([cls instancesRespondToSelector:s6]) MSHookMessageEx(cls, s6, (IMP)hook_##P##_isDispIconInLoc, (IMP *)&orig_##P##_isDispIconInLoc); \
+    SEL s7 = NSSelectorFromString(@"isDisplayingIcon:inLocations:"); \
+    if ([cls instancesRespondToSelector:s7]) MSHookMessageEx(cls, s7, (IMP)hook_##P##_isDispIconInLocs, (IMP *)&orig_##P##_isDispIconInLocs); \
+    SEL s8 = NSSelectorFromString(@"isDisplayingIconView:"); \
+    if ([cls instancesRespondToSelector:s8]) MSHookMessageEx(cls, s8, (IMP)hook_##P##_isDispIconView, (IMP *)&orig_##P##_isDispIconView); \
+    SEL s9 = NSSelectorFromString(@"isDisplayingIconView:inLocation:"); \
+    if ([cls instancesRespondToSelector:s9]) MSHookMessageEx(cls, s9, (IMP)hook_##P##_isDispIconViewInLoc, (IMP *)&orig_##P##_isDispIconViewInLoc); \
+}
+
+DFE_DEFINE_QUERY_HOOKS(mgr)
+DFE_DEFINE_QUERY_HOOKS(ctrl)
+DFE_DEFINE_QUERY_HOOKS(root)
 
 static void DFERelayoutPageVerticallyIfNeeded(DockFlipController *ctrl, UIView *list) {
     if (!DFEIsVerticalDock(ctrl)) return;
@@ -719,8 +924,6 @@ static void DFERelayoutPageVerticallyIfNeeded(DockFlipController *ctrl, UIView *
         iv.frame = CGRectMake(round(midX - iconSize * 0.5), round(cy - iconSize * 0.5), iconSize, iconSize);
     }
 }
-
-static NSHashTable<UIView *> *gDFETrackedIconViews = nil;
 
 static void DFETrackIconView(UIView *iconView) {
     if (!iconView) return;
@@ -1205,7 +1408,15 @@ static void TryHookDockFlipController(void) {
         if ([iconMgrCls instancesRespondToSelector:iconTappedModSel]) {
             MSHookMessageEx(iconMgrCls, iconTappedModSel, (IMP)hook_mgr_iconTappedModifiers, (IMP *)&orig_mgr_iconTappedModifiers);
         }
+        SEL scrollSel = NSSelectorFromString(@"scrollToIconListContainingIcon:animate:");
+        if ([iconMgrCls instancesRespondToSelector:scrollSel]) {
+            MSHookMessageEx(iconMgrCls, scrollSel, (IMP)hook_mgr_scrollToIconList, (IMP *)&orig_mgr_scrollToIconList);
+        }
+        DFEInstallQueryHooks_mgr(iconMgrCls);
     }
+
+    DFEInstallQueryHooks_ctrl(objc_getClass("SBIconController"));
+    DFEInstallQueryHooks_root(objc_getClass("SBRootFolderController"));
 
     // Defer right-edge system gesture gate on Home Screen when Plus vertical Dock is active
     Class hsVCCls = objc_getClass("SBHomeScreenViewController");

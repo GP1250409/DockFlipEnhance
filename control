@@ -1,6 +1,6 @@
 Package: cc.gonepaul.dockflipenhance
 Name: DockFlip 增强补丁 (RootHide)
-Version: 0.3.2
+Version: 0.3.3
 Architecture: iphoneos-arm64e
 Description: All-in-one DockFlip enhancement for iOS 16 RootHide arm64e: native badge sync, bidirectional infinite dock paging, Plus landscape vertical Dock support, native SBIconView Quick Actions menu, and AppData / Choicy support.
 Maintainer: Paul
